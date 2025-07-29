@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bitcoin::Script;
+use bitcoin::{Script, Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    GetHistory, HeadersSubscribe, Ping, ScriptHashSubscribe, ScriptHashUnsubscribe,
+    GetHistory, GetTx, HeadersSubscribe, Ping, ScriptHashSubscribe, ScriptHashUnsubscribe,
 };
 use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::{
@@ -76,6 +76,7 @@ enum Command {
     ScriptHashSubscribe(ElectrumScriptHash),
     ScriptHashUnsubscribe(ElectrumScriptHash),
     GetHistory(ElectrumScriptHash),
+    GetTransaction { txid: Txid },
 }
 
 #[derive(Debug)]
@@ -503,6 +504,9 @@ impl ElectrumClient {
                                     script_hash,
                                 })?;
                             }
+                            Command::GetTransaction { txid } => {
+                                client.send_event_request(GetTx { txid })?;
+                            }
                         }
                     }
                 }
@@ -682,6 +686,53 @@ impl ElectrumClient {
                         }
                         Event::ResponseError(ErroredRequest::GetHistory { req, error }) => {
                             if req.script_hash == script_hash {
+                                return Err(Error::Response(error));
+                            }
+                        }
+                        _ => {}
+                    },
+                    InternalNotification::Notification(notification) => match notification {
+                        ElectrumNotification::ConnectionStatusChanged(status) => {
+                            if status.is_disconnected() {
+                                return Err(Error::Disconnected);
+                            }
+                        }
+                        ElectrumNotification::Shutdown => break,
+                        _ => {}
+                    },
+                }
+            }
+
+            Err(Error::PrematureExit)
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Request history for scripts
+    pub async fn get_transaction(
+        &self,
+        txid: Txid,
+        timeout: Duration,
+    ) -> Result<Transaction, Error> {
+        // Subscribe to notifications
+        let mut notifications = self.internal_notifications.subscribe();
+
+        // Send command
+        self.send_command(Command::GetTransaction { txid })?;
+
+        // Wait for response
+        time::timeout(timeout, async {
+            while let Ok(notification) = notifications.recv().await {
+                match notification {
+                    InternalNotification::Event(event) => match event {
+                        Event::Response(SatisfiedRequest::GetTx { req, resp }) => {
+                            if req.txid == txid {
+                                return Ok(resp.tx);
+                            }
+                        }
+                        Event::ResponseError(ErroredRequest::GetTx { req, error }) => {
+                            if req.txid == txid {
                                 return Err(Error::Response(error));
                             }
                         }
