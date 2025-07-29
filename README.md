@@ -1,21 +1,9 @@
 # Tokio Electrum client
 
-## Description
+## Project structure
 
-High-level Electrum client implementation, featuring automatic reconnection handling and real-time (block/scripts) updates.
-
-## Features
-
-The following crate feature flags are available:
-
-| Feature     | Default | Description                 |
-|-------------|:-------:|-----------------------------|
-| `socks`     |   No    | Enable socks5 proxy support |
+- [tokio-electrum](tokio-electrum): High-level Electrum client implementation, featuring automatic reconnection handling and real-time (block/scripts) updates.
 
 ## License
 
 This project is distributed under the MIT software license - see the [LICENSE](LICENSE) file for details
-
-## TODOs
-
-Add a default implementation for usage with BDK (`bdk-tokio-electrum`)

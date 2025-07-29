@@ -1,28 +1,12 @@
-[package]
-name = "tokio-electrum"
-version = "0.1.0"
-edition = "2021"
-description = "High-level Electrum client implementation, featuring automatic reconnection handling and real-time (block/scripts) updates."
+[workspace]
+members = [
+    "tokio-electrum",
+]
+default-members = ["tokio-electrum"]
+resolver = "2"
+
+[workspace.package]
 authors = ["Yuki Kishimoto <yukikishimoto@protonmail.com>"]
 homepage = "https://github.com/shadowylab/tokio-electrum"
 repository = "https://github.com/shadowylab/tokio-electrum.git"
 license = "MIT"
-readme = "README.md"
-keywords = ["bitcoin", "electrum", "tokio"]
-
-[dependencies]
-bitcoin = "0.32"
-electrum_streaming_client = { git = "https://github.com/bitcoindevkit/electrum_streaming_client", rev = "d384cf2fa9640f0dbd7be25964b686ece6c92976", features = ["tokio"] }
-futures = "0.3"
-thiserror = "2.0"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = "0.26"
-# tokio-socks = "0.5" # TODO: needed for the future, to support proxy
-tracing = "0.1"
-webpki-roots = "1.0"
-
-[dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[[example]]
-name = "electrum_client"
