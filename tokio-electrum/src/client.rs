@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bitcoin::block::Header;
 use bitcoin::{Script, Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    GetHistory, GetTx, HeadersSubscribe, Ping, ScriptHashSubscribe, ScriptHashUnsubscribe,
+    GetHistory, GetTx, Header as GetBlockHeader, HeadersSubscribe, Ping, ScriptHashSubscribe,
+    ScriptHashUnsubscribe,
 };
 use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::{
@@ -72,6 +74,7 @@ pub enum Error {
 }
 
 enum Command {
+    BlockHeader { height: u32 },
     HeadersSubscribe,
     ScriptHashSubscribe(ElectrumScriptHash),
     ScriptHashUnsubscribe(ElectrumScriptHash),
@@ -469,6 +472,9 @@ impl ElectrumClient {
                 Some(commands) = rx_command.recv() => {
                     for command in commands.into_iter() {
                         match command {
+                            Command::BlockHeader {height} => {
+                                client.send_event_request(GetBlockHeader { height })?;
+                            }
                             Command::HeadersSubscribe => {
                                 // Mark as subscribed
                                 // This allows to automatically re-subscribe in case of disconnection.
@@ -621,6 +627,43 @@ impl ElectrumClient {
             .0
             .try_send(commands)
             .map_err(|e| Error::MpscCommandTrySend(e.to_string()))
+    }
+
+    pub async fn block_header(&self, height: u32) -> Result<Header, Error> {
+        // Subscribe to notifications
+        let mut notifications = self.internal_notifications.subscribe();
+
+        // Send command
+        self.send_command(Command::BlockHeader { height })?;
+
+        while let Ok(notification) = notifications.recv().await {
+            match notification {
+                InternalNotification::Event(event) => match event {
+                    Event::Response(SatisfiedRequest::Header { req, resp }) => {
+                        if req.height == height {
+                            return Ok(resp.header);
+                        }
+                    }
+                    Event::ResponseError(ErroredRequest::Header { req, error }) => {
+                        if req.height == height {
+                            return Err(Error::Response(error));
+                        }
+                    }
+                    _ => {}
+                },
+                InternalNotification::Notification(notification) => match notification {
+                    ElectrumNotification::ConnectionStatusChanged(status) => {
+                        if status.is_disconnected() {
+                            return Err(Error::Disconnected);
+                        }
+                    }
+                    ElectrumNotification::Shutdown => break,
+                    _ => {}
+                },
+            }
+        }
+
+        Err(Error::PrematureExit)
     }
 
     /// Subscribe to headers
