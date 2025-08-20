@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 use std::io;
+#[cfg(feature = "socks")]
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -32,9 +34,11 @@ use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
-use crate::config::ElectrumConfig;
+use crate::config::{ElectrumConfig, ElectrumConnectionMode};
 use crate::constant::PING_INTERVAL;
 use crate::notification::ElectrumNotification;
+#[cfg(feature = "socks")]
+use crate::socks::TcpSocks5Stream;
 use crate::status::{AtomicElectrumConnectionStatus, ElectrumConnectionStatus};
 use crate::types::{BlockHeader, BlockHeaders, ElectrumScriptHash, TransactionMerkel};
 
@@ -62,6 +66,10 @@ pub enum Error {
     /// Response error
     #[error(transparent)]
     Response(#[from] ResponseError),
+    /// Socks error
+    #[error(transparent)]
+    #[cfg(feature = "socks")]
+    Socks(#[from] tokio_socks::Error),
     /// MPSC try send error
     #[error("{0}")]
     MpscTrySend(String),
@@ -346,7 +354,7 @@ impl ElectrumClient {
         // At this stem is NOT required to close the WebSocket connection.
         tokio::select! {
             // Connect
-            res = connect(&self.addr, timeout) => match res {
+            res = connect(&self.addr, self.config.connection_mode, timeout) => match res {
                 Ok((reader, writer)) => {
                     // Update status
                     self.set_status(ElectrumConnectionStatus::Connected, true);
@@ -745,32 +753,100 @@ impl ElectrumClient {
     }
 }
 
+fn split_stream<T>(stream: T) -> (BoxReadStream, BoxWriteStream)
+where
+    T: AsyncRead + AsyncWrite + Send + 'static,
+{
+    // Split stream
+    let (reader, writer) = tokio::io::split(stream);
+
+    // Box split stream
+    (Box::new(reader), Box::new(writer))
+}
+
 async fn connect(
     addr: &ElectrumServerAddress,
+    mode: ElectrumConnectionMode,
     timeout: Duration,
 ) -> Result<(BoxReadStream, BoxWriteStream), Error> {
     match addr.scheme() {
-        Scheme::Tcp => time::timeout(timeout, connect_tcp(addr.addr()))
+        Scheme::Tcp => time::timeout(timeout, connect_tcp(addr.addr(), mode))
             .await
             .map_err(|_| Error::Timeout)?,
-        Scheme::Ssl => time::timeout(timeout, connect_ssl(addr.addr()))
+        Scheme::Ssl => time::timeout(timeout, connect_ssl(addr.addr(), mode))
             .await
             .map_err(|_| Error::Timeout)?,
     }
 }
 
-async fn connect_tcp(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+async fn connect_tcp(
+    addr: &HostAndPort,
+    mode: ElectrumConnectionMode,
+) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    match mode {
+        ElectrumConnectionMode::Direct => connect_direct_tcp(addr).await,
+        #[cfg(feature = "socks")]
+        ElectrumConnectionMode::Proxy(proxy) => connect_proxy_tcp(addr, proxy).await,
+    }
+}
+
+async fn connect_direct_tcp(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
     // Connect
     let stream: TcpStream = TcpStream::connect(addr.to_string()).await?;
 
     // Split stream
-    let (reader, writer) = tokio::io::split(stream);
-
-    // Box split stream
-    Ok((Box::new(reader), Box::new(writer)))
+    Ok(split_stream(stream))
 }
 
-async fn connect_ssl(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+#[cfg(feature = "socks")]
+async fn connect_proxy_tcp(
+    addr: &HostAndPort,
+    proxy: SocketAddr,
+) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    let stream: TcpStream = TcpSocks5Stream::connect(proxy, addr.to_string()).await?;
+
+    // Split stream
+    Ok(split_stream(stream))
+}
+
+async fn connect_ssl(
+    addr: &HostAndPort,
+    mode: ElectrumConnectionMode,
+) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    match mode {
+        ElectrumConnectionMode::Direct => connect_direct_ssl(addr).await,
+        #[cfg(feature = "socks")]
+        ElectrumConnectionMode::Proxy(proxy) => connect_proxy_ssl(addr, proxy).await,
+    }
+}
+
+async fn connect_direct_ssl(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    // Connect to the server
+    let tcp_stream: TcpStream = TcpStream::connect(addr.to_string()).await?;
+
+    // Create TLS configuration
+    ssl_connector(addr, tcp_stream).await
+}
+
+#[cfg(feature = "socks")]
+async fn connect_proxy_ssl(
+    addr: &HostAndPort,
+    proxy: SocketAddr,
+) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    // Connect to the server
+    let tcp_stream: TcpStream = TcpSocks5Stream::connect(proxy, addr.to_string()).await?;
+
+    // Create TLS configuration
+    ssl_connector(addr, tcp_stream).await
+}
+
+async fn ssl_connector<T>(
+    addr: &HostAndPort,
+    tcp_stream: T,
+) -> Result<(BoxReadStream, BoxWriteStream), Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Create TLS configuration
     let mut root_cert_store: RootCertStore = RootCertStore::empty();
     root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -784,15 +860,11 @@ async fn connect_ssl(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStrea
     let hostname: String = addr.host.to_string();
 
     // Connect to the server
-    let tcp_stream: TcpStream = TcpStream::connect(addr.to_string()).await?;
     let domain: ServerName = ServerName::try_from(hostname)?;
-    let tls_stream: TlsStream<TcpStream> = connector.connect(domain, tcp_stream).await?;
+    let tls_stream: TlsStream<_> = connector.connect(domain, tcp_stream).await?;
 
     // Split stream
-    let (reader, writer) = tokio::io::split(tls_stream);
-
-    // Box split stream
-    Ok((Box::new(reader), Box::new(writer)))
+    Ok(split_stream(tls_stream))
 }
 
 async fn send_request_with_timeout<Req>(

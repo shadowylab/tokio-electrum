@@ -11,6 +11,10 @@ readme = "README.md"
 rust-version.workspace = true
 keywords = ["bitcoin", "electrum", "tokio"]
 
+[features]
+default = ["socks"]
+socks = ["dep:tokio-socks"]
+
 [dependencies]
 bitcoin = "0.32"
 electrum_streaming_client = { git = "https://github.com/bitcoindevkit/electrum_streaming_client", rev = "d384cf2fa9640f0dbd7be25964b686ece6c92976", features = ["tokio"] }
@@ -18,7 +22,7 @@ futures = "0.3"
 thiserror = "2.0"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
-# tokio-socks = "0.5" # TODO: needed for the future, to support proxy
+tokio-socks = { version =  "0.5", optional = true }
 tracing = "0.1"
 webpki-roots = "1.0"
 

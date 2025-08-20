@@ -11,5 +11,7 @@ pub mod config;
 mod constant;
 pub mod notification;
 pub mod prelude;
+#[cfg(feature = "socks")]
+mod socks;
 pub mod status;
 pub mod types;
