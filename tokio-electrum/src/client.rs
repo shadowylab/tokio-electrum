@@ -527,6 +527,13 @@ impl ElectrumClient {
                             status: resp,
                         })
                     }
+                    SatisfiedRequest::ScriptHashUnsubscribe { req, .. } => {
+                        // Mark as unsubscribed
+                        let mut script_hashes_set = self.traker.script_hashes.write().await;
+                        script_hashes_set.remove(&req.script_hash);
+
+                        None
+                    }
                     _ => None,
                 },
                 Event::ResponseError(err) => {
