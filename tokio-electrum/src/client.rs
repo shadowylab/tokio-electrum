@@ -12,8 +12,8 @@ use bitcoin::block::Header;
 use bitcoin::{Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, Headers, HeadersSubscribe, Ping,
-    ScriptHashSubscribe, ScriptHashUnsubscribe,
+    BroadcastTx, GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, Headers,
+    HeadersSubscribe, Ping, ScriptHashSubscribe, ScriptHashUnsubscribe,
 };
 use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::{
@@ -789,6 +789,20 @@ impl ElectrumClient {
             .await
             .map_err(|_| Error::Timeout)??;
         Ok(TransactionMerkel::from(resp))
+    }
+
+    /// Broadcast a transaction
+    pub async fn broadcast_tx(&self, tx: Transaction) -> Result<Txid, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(BroadcastTx(tx));
+
+        self.send_batch(batch)?;
+
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+
+        Ok(resp)
     }
 }
 
