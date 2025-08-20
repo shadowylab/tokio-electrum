@@ -30,7 +30,7 @@ async fn main() {
     let mut notification = client.notifications();
 
     // Subscribe to block headers
-    client.subscribe_headers().unwrap();
+    client.block_headers_subscribe().unwrap();
 
     // Handle notifications
     while let Ok(notification) = notification.recv().await {

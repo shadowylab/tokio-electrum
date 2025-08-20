@@ -1,0 +1,42 @@
+use bitcoin::absolute::Height;
+use bitcoin::block::Header;
+use bitcoin::hashes::sha256d::Hash as Sha256d;
+pub use electrum_streaming_client::response::Tx;
+use electrum_streaming_client::response::{HeadersSubscribeResp, TxMerkle};
+pub use electrum_streaming_client::{ElectrumScriptHash, ElectrumScriptStatus};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockHeader {
+    /// Block header.
+    pub header: Header,
+    /// The height of the block in the header.
+    pub height: u32,
+}
+
+impl From<HeadersSubscribeResp> for BlockHeader {
+    fn from(headers_subscribe_resp: HeadersSubscribeResp) -> Self {
+        Self {
+            height: headers_subscribe_resp.height,
+            header: headers_subscribe_resp.header,
+        }
+    }
+}
+
+pub struct TransactionMerkel {
+    /// The height of the block containing the transaction.
+    pub block_height: Height,
+    /// The Merkle branch connecting the transaction to the block root.
+    pub merkle: Vec<Sha256d>,
+    /// The transaction's position in the block's Merkle tree.
+    pub pos: usize,
+}
+
+impl From<TxMerkle> for TransactionMerkel {
+    fn from(tx_merkle: TxMerkle) -> Self {
+        Self {
+            block_height: tx_merkle.block_height,
+            merkle: tx_merkle.merkle,
+            pos: tx_merkle.pos,
+        }
+    }
+}

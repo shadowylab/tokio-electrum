@@ -1,7 +1,7 @@
 use bitcoin::block::Header;
 
-use crate::hash::{ElectrumScriptHash, ElectrumScriptStatus};
 use crate::status::ElectrumConnectionStatus;
+use crate::types::{ElectrumScriptHash, ElectrumScriptStatus};
 
 /// Electrum notification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

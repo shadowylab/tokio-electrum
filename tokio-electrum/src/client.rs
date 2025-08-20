@@ -8,8 +8,8 @@ use bitcoin::block::Header;
 use bitcoin::{Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    GetHistory, GetTx, Header as GetBlockHeader, HeadersSubscribe, Ping, ScriptHashSubscribe,
-    ScriptHashUnsubscribe,
+    GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, HeadersSubscribe, Ping,
+    ScriptHashSubscribe, ScriptHashUnsubscribe,
 };
 use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::{
@@ -32,9 +32,9 @@ use tokio_rustls::TlsConnector;
 use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
 use crate::config::ElectrumConfig;
 use crate::constant::PING_INTERVAL;
-use crate::hash::ElectrumScriptHash;
 use crate::notification::ElectrumNotification;
 use crate::status::{AtomicElectrumConnectionStatus, ElectrumConnectionStatus};
+use crate::types::{BlockHeader, ElectrumScriptHash, TransactionMerkel};
 
 type BoxReadStream = Box<dyn AsyncRead + Send + Unpin>;
 type BoxWriteStream = Box<dyn AsyncWrite + Send + Unpin>;
@@ -582,10 +582,20 @@ impl ElectrumClient {
         Ok(resp.header)
     }
 
-    /// Subscribe to headers
+    /// Subscribe to block headers and return the current blockchain tip.
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
-    pub fn subscribe_headers(&self) -> Result<(), Error> {
+    pub async fn get_tip(&self) -> Result<BlockHeader, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(HeadersSubscribe);
+        self.send_batch(batch)?;
+        Ok(BlockHeader::from(fut.await?))
+    }
+
+    /// Subscribe to block headers
+    ///
+    /// The updates can be monitored with [`ElectrumClient::notifications`].
+    pub fn block_headers_subscribe(&self) -> Result<(), Error> {
         let mut batch = AsyncBatchRequest::new();
         batch.event_request(HeadersSubscribe);
         self.send_batch(batch)?;
@@ -596,21 +606,27 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     #[inline]
-    pub fn subscribe_script_hash(&self, script_hash: ElectrumScriptHash) -> Result<(), Error> {
-        self.batch_subscribe_script_hashes(vec![script_hash])
+    pub fn script_hash_subscribe<T>(&self, script_hash: T) -> Result<(), Error>
+    where
+        T: Into<ElectrumScriptHash>,
+    {
+        self.batch_script_hash_subscribe(vec![script_hash])
     }
 
     /// Subscribe to script hashes
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
-    pub fn batch_subscribe_script_hashes<I>(&self, script_hashes: I) -> Result<(), Error>
+    pub fn batch_script_hash_subscribe<I, T>(&self, script_hashes: I) -> Result<(), Error>
     where
-        I: IntoIterator<Item = ElectrumScriptHash>,
+        I: IntoIterator<Item = T>,
+        T: Into<ElectrumScriptHash>,
     {
         let mut batch = AsyncBatchRequest::new();
 
         for script_hash in script_hashes {
-            batch.event_request(ScriptHashSubscribe { script_hash });
+            batch.event_request(ScriptHashSubscribe {
+                script_hash: script_hash.into(),
+            });
         }
 
         self.send_batch(batch)?;
@@ -619,36 +635,49 @@ impl ElectrumClient {
     }
 
     /// Unsubscribe from a script hash
-    pub fn unsubscribe_script_hash(&self, script_hash: ElectrumScriptHash) -> Result<(), Error> {
+    pub fn script_hash_unsubscribe<T>(&self, script_hash: T) -> Result<(), Error>
+    where
+        T: Into<ElectrumScriptHash>,
+    {
         let mut batch = AsyncBatchRequest::new();
-        batch.event_request(ScriptHashUnsubscribe { script_hash });
+        batch.event_request(ScriptHashUnsubscribe {
+            script_hash: script_hash.into(),
+        });
         self.send_batch(batch)?;
         Ok(())
     }
 
-    /// Request history for scripts
-    pub async fn script_get_history(
-        &self,
-        script_hash: ElectrumScriptHash,
-    ) -> Result<Vec<Tx>, Error> {
+    /// Get history for scripts
+    pub async fn script_get_history<T>(&self, script_hash: T) -> Result<Vec<Tx>, Error>
+    where
+        T: Into<ElectrumScriptHash>,
+    {
         let mut batch = AsyncBatchRequest::new();
-        let fut = batch.request(GetHistory { script_hash });
+        let fut = batch.request(GetHistory {
+            script_hash: script_hash.into(),
+        });
 
         self.send_batch(batch)?;
 
         Ok(fut.await?)
     }
 
-    pub async fn batch_script_get_history<I>(&self, script_hashes: I) -> Result<Vec<Vec<Tx>>, Error>
+    pub async fn batch_script_get_history<I, T>(
+        &self,
+        script_hashes: I,
+    ) -> Result<Vec<Vec<Tx>>, Error>
     where
-        I: IntoIterator<Item = ElectrumScriptHash>,
+        I: IntoIterator<Item = T>,
+        T: Into<ElectrumScriptHash>,
     {
         let mut batch = AsyncBatchRequest::new();
 
         let mut futures = Vec::new();
 
         for script_hash in script_hashes {
-            let fut = batch.request(GetHistory { script_hash });
+            let fut = batch.request(GetHistory {
+                script_hash: script_hash.into(),
+            });
             futures.push(fut);
         }
 
@@ -667,8 +696,8 @@ impl ElectrumClient {
         Ok(output)
     }
 
-    /// Request history for scripts
-    pub async fn get_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
+    /// Get transaction
+    pub async fn transaction_get(&self, txid: Txid) -> Result<Transaction, Error> {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetTx { txid });
 
@@ -676,6 +705,20 @@ impl ElectrumClient {
 
         let resp = fut.await?;
         Ok(resp.tx)
+    }
+
+    /// Get transaction merkle
+    pub async fn transaction_get_merkle(
+        &self,
+        txid: Txid,
+        height: u32,
+    ) -> Result<TransactionMerkel, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(GetTxMerkle { txid, height });
+
+        self.send_batch(batch)?;
+
+        Ok(TransactionMerkel::from(fut.await?))
     }
 }
 
