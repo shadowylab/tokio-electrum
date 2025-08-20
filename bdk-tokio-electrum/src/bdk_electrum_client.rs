@@ -19,14 +19,14 @@ const CHAIN_SUFFIX_LENGTH: u32 = 8;
 
 /// Wrapper around [`ElectrumClient`] which includes an internal in-memory
 /// transaction cache to avoid re-fetching already downloaded transactions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BdkElectrumClient {
     /// The underlying electrum client.
     inner: ElectrumClient,
     /// The transaction cache
-    tx_cache: Mutex<HashMap<Txid, Arc<Transaction>>>,
+    tx_cache: Arc<Mutex<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
-    block_header_cache: Mutex<HashMap<u32, Header>>,
+    block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
 }
 
 impl Deref for BdkElectrumClient {
