@@ -1,5 +1,4 @@
 use bitcoin::block::Header;
-use electrum_streaming_client::Event;
 
 use crate::hash::{ElectrumScriptHash, ElectrumScriptStatus};
 use crate::status::ElectrumConnectionStatus;
@@ -25,10 +24,4 @@ pub enum ElectrumNotification {
     },
     /// The client has been shutdown
     Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum InternalNotification {
-    Notification(ElectrumNotification),
-    Event(Event),
 }

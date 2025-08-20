@@ -1,7 +1,7 @@
 use std::str::FromStr;
-use std::time::Duration;
 
 use bitcoin::{Address, Network};
+use electrum_streaming_client::ElectrumScriptHash;
 use tokio_electrum::address::ElectrumServerAddress;
 use tokio_electrum::client::ElectrumClient;
 use tokio_electrum::notification::ElectrumNotification;
@@ -22,7 +22,8 @@ async fn main() {
     let address = Address::from_str("1DWYVT2Db2ct7dG4Wf6bBD9yVhvsWhJWYj").unwrap();
     let address = address.require_network(Network::Bitcoin).unwrap();
     let script = address.script_pubkey();
-    let txs = client.script_get_history(&script).await.unwrap();
+    let script_hash = ElectrumScriptHash::new(script);
+    let txs = client.script_get_history(script_hash).await.unwrap();
     println!("{:?}", txs);
 
     // Subscribe to notifications

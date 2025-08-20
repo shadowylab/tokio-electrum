@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::block::Header;
-use bitcoin::{Script, Transaction, Txid};
+use bitcoin::{Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
     GetHistory, GetTx, Header as GetBlockHeader, HeadersSubscribe, Ping, ScriptHashSubscribe,
@@ -13,16 +13,16 @@ use electrum_streaming_client::request::{
 };
 use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::{
-    AsyncClient, AsyncEventReceiver, AsyncPendingRequest, AsyncPendingRequestTuple,
-    AsyncRequestError, AsyncRequestSendError, ErroredRequest, Event, Request, ResponseError,
-    SatisfiedRequest,
+    AsyncBatchRequest, AsyncClient, AsyncEventReceiver, AsyncPendingRequest,
+    AsyncPendingRequestTuple, AsyncRequestError, AsyncRequestSendError, BatchRequestError, Event,
+    Request, ResponseError, SatisfiedRequest,
 };
-use futures::StreamExt;
+use futures::{future, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, Notify, RwLock};
 use tokio::time;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
@@ -33,7 +33,7 @@ use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
 use crate::config::ElectrumConfig;
 use crate::constant::PING_INTERVAL;
 use crate::hash::ElectrumScriptHash;
-use crate::notification::{ElectrumNotification, InternalNotification};
+use crate::notification::ElectrumNotification;
 use crate::status::{AtomicElectrumConnectionStatus, ElectrumConnectionStatus};
 
 type BoxReadStream = Box<dyn AsyncRead + Send + Unpin>;
@@ -51,6 +51,9 @@ pub enum Error {
     /// Electrum async send request error
     #[error(transparent)]
     AsyncRequestSend(#[from] AsyncRequestSendError),
+    /// Batch request error
+    #[error(transparent)]
+    BatchRequest(#[from] BatchRequestError),
     /// Electrum async request error
     #[error(transparent)]
     AsyncRequest(#[from] AsyncRequestError),
@@ -68,23 +71,14 @@ pub enum Error {
     /// Termination request
     #[error("termination request")]
     TerminationRequest,
-    /// Premature exit
-    #[error("premature exit")]
-    PrematureExit,
-}
-
-enum Command {
-    BlockHeader { height: u32 },
-    HeadersSubscribe,
-    ScriptHashSubscribe(ElectrumScriptHash),
-    ScriptHashUnsubscribe(ElectrumScriptHash),
-    GetHistory(ElectrumScriptHash),
-    GetTransaction { txid: Txid },
 }
 
 #[derive(Debug)]
 struct Channels {
-    commands: (Sender<Vec<Command>>, Mutex<Receiver<Vec<Command>>>),
+    commands: (
+        Sender<AsyncBatchRequest>,
+        Mutex<Receiver<AsyncBatchRequest>>,
+    ),
     ping: Notify,
     terminate: Notify,
 }
@@ -102,7 +96,7 @@ impl Channels {
     }
 
     #[inline]
-    pub async fn rx_commands(&self) -> MutexGuard<'_, Receiver<Vec<Command>>> {
+    pub async fn rx_batch_requests(&self) -> MutexGuard<'_, Receiver<AsyncBatchRequest>> {
         self.commands.1.lock().await
     }
 
@@ -119,19 +113,28 @@ impl Channels {
 
 #[derive(Debug, Default)]
 struct ServicesTracker {
-    headers_subscribed: bool,
-    script_hashes: HashSet<ElectrumScriptHash>,
+    headers_subscribed: AtomicBool,
+    script_hashes: RwLock<HashSet<ElectrumScriptHash>>,
 }
 
 impl ServicesTracker {
     #[inline]
     fn is_headers_subscribed(&self) -> bool {
-        self.headers_subscribed
+        self.headers_subscribed.load(Ordering::SeqCst)
     }
 
     #[inline]
-    fn set_headers_subscribed(&mut self, value: bool) {
-        self.headers_subscribed = value
+    fn set_headers_subscribed(&self, value: bool) {
+        self.headers_subscribed.store(value, Ordering::SeqCst);
+    }
+
+    async fn reset(&self) {
+        // Reset headers subscription
+        self.set_headers_subscribed(false);
+
+        // Reset script hashes
+        let mut script_hashes = self.script_hashes.write().await;
+        script_hashes.clear();
     }
 }
 
@@ -141,9 +144,7 @@ pub struct ElectrumClient {
     status: Arc<AtomicElectrumConnectionStatus>,
     running: Arc<AtomicBool>,
     channels: Arc<Channels>,
-    /// Internal notifications
-    internal_notifications: broadcast::Sender<InternalNotification>,
-    /// External notification sender
+    traker: Arc<ServicesTracker>,
     notification_sender: broadcast::Sender<ElectrumNotification>,
     config: ElectrumConfig,
 }
@@ -158,14 +159,13 @@ impl ElectrumClient {
     /// Construct a new electrum client
     pub fn with_config(addr: ElectrumServerAddress, config: ElectrumConfig) -> Self {
         let (notification_sender, ..) = broadcast::channel(config.notification_channel_size);
-        let (internal_notifications, ..) = broadcast::channel(config.notification_channel_size);
 
         Self {
             addr,
             status: Arc::new(AtomicElectrumConnectionStatus::default()),
             running: Arc::new(AtomicBool::new(false)),
             channels: Arc::new(Channels::new()),
-            internal_notifications,
+            traker: Arc::new(ServicesTracker::default()),
             notification_sender,
             config,
         }
@@ -187,17 +187,8 @@ impl ElectrumClient {
     }
 
     #[inline]
-    fn send_notification(&self, notification: InternalNotification, external: bool) {
-        if external {
-            let _ = self.internal_notifications.send(notification.clone());
-
-            // Send external notification
-            if let InternalNotification::Notification(notification) = notification {
-                let _ = self.notification_sender.send(notification);
-            }
-        } else {
-            let _ = self.internal_notifications.send(notification);
-        }
+    fn send_notification(&self, notification: ElectrumNotification) {
+        let _ = self.notification_sender.send(notification);
     }
 
     /// Get the current connection status
@@ -235,12 +226,7 @@ impl ElectrumClient {
         }
 
         // Send notification
-        self.send_notification(
-            InternalNotification::Notification(ElectrumNotification::ConnectionStatusChanged(
-                status,
-            )),
-            true,
-        );
+        self.send_notification(ElectrumNotification::ConnectionStatusChanged(status));
     }
 
     /// Connect to the electrum server and keep the connection alive.
@@ -288,19 +274,17 @@ impl ElectrumClient {
             return;
         }
 
-        // Lock receiver
-        let mut rx_commands = self.channels.rx_commands().await;
+        // Reset service tracker
+        self.traker.reset().await;
 
-        // Build a new default service tracker
-        // This store the data until the client is terminated
-        let mut service_tracker = ServicesTracker::default();
+        // Lock receiver
+        let mut rx_batch_requests = self.channels.rx_batch_requests().await;
 
         // Auto-connect loop
         loop {
             // Connect and run message handler
             // The termination requests are handled inside this method!
-            self.connect_and_run(&mut rx_commands, &mut service_tracker)
-                .await;
+            self.connect_and_run(&mut rx_batch_requests).await;
 
             // Get status
             let status: ElectrumConnectionStatus = self.status();
@@ -381,13 +365,12 @@ impl ElectrumClient {
     /// Connect and run message handler
     async fn connect_and_run(
         &self,
-        rx_commands: &mut MutexGuard<'_, Receiver<Vec<Command>>>,
-        services_tracker: &mut ServicesTracker,
+        rx_batch_requests: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) {
         match self._try_connect(self.config.connection_timeout).await {
             // Connection success, go to post-connection stage
             Ok((reader, writer)) => {
-                self.post_connection(reader, writer, rx_commands, services_tracker)
+                self.post_connection(reader, writer, rx_batch_requests)
                     .await
             }
             // Error during connection
@@ -403,33 +386,42 @@ impl ElectrumClient {
         &self,
         reader: BoxReadStream,
         writer: BoxWriteStream,
-        rx_commands: &mut MutexGuard<'_, Receiver<Vec<Command>>>,
-        services_tracker: &mut ServicesTracker,
+        rx_batch_requests: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) {
         // Construct new electrum async client
         let (client, receiver, worker) = AsyncClient::new_tokio(reader, writer);
 
         // If the header subscription was enabled, resubscribe.
-        if services_tracker.is_headers_subscribed() {
+        if self.traker.is_headers_subscribed() {
             tracing::debug!(addr = %self.addr, "Resubscribing to headers.");
-            if let Err(e) = self.send_command(Command::HeadersSubscribe) {
+
+            let mut batch = AsyncBatchRequest::new();
+            batch.event_request(HeadersSubscribe);
+
+            if let Err(e) = client.send_batch(batch) {
                 tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.");
             }
         }
 
-        // If are cached any script hashes, resubscribe.
-        if !services_tracker.script_hashes.is_empty() {
-            tracing::debug!(addr = %self.addr, "Resubscribing to script hashes.");
+        {
+            // Acquire read lock
+            let script_hashes = self.traker.script_hashes.read().await;
 
-            let commands: Vec<Command> = services_tracker
-                .script_hashes
-                .iter()
-                .copied()
-                .map(Command::ScriptHashSubscribe)
-                .collect();
+            // If are cached any script hashes, resubscribe.
+            if !script_hashes.is_empty() {
+                tracing::debug!(addr = %self.addr, "Resubscribing to script hashes.");
 
-            if let Err(e) = self.batch_commands(commands) {
-                tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.");
+                let mut batch = AsyncBatchRequest::new();
+
+                for script_hash in script_hashes.iter().copied() {
+                    batch.event_request(ScriptHashSubscribe { script_hash });
+                }
+
+                drop(script_hashes);
+
+                if let Err(e) = self.send_batch(batch) {
+                    tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.");
+                }
             }
         }
 
@@ -441,7 +433,7 @@ impl ElectrumClient {
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum worker exited with error.")
             },
             // Message sender handler
-            res = self.sender_message_handler(&client, rx_commands, services_tracker) => match res {
+            res = self.sender_message_handler(&client, rx_batch_requests) => match res {
                 Ok(()) => tracing::trace!(addr = %self.addr, "Electrum sender exited."),
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum sender exited with error.")
             },
@@ -463,58 +455,13 @@ impl ElectrumClient {
     async fn sender_message_handler(
         &self,
         client: &AsyncClient,
-        rx_command: &mut MutexGuard<'_, Receiver<Vec<Command>>>,
-        services_tracker: &mut ServicesTracker,
+        rx_batch_request: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) -> Result<(), Error> {
         loop {
             tokio::select! {
-                // Commands receiver
-                Some(commands) = rx_command.recv() => {
-                    for command in commands.into_iter() {
-                        match command {
-                            Command::BlockHeader {height} => {
-                                client.send_event_request(GetBlockHeader { height })?;
-                            }
-                            Command::HeadersSubscribe => {
-                                // Mark as subscribed
-                                // This allows to automatically re-subscribe in case of disconnection.
-                                services_tracker.set_headers_subscribed(true);
-
-                                // Send request
-                                client.send_event_request(HeadersSubscribe)?;
-                            }
-                            Command::ScriptHashSubscribe(script_hash) => {
-                                // Cache it
-                                // Return true if is successfully cached, meaning wasn't already inserted
-                                if services_tracker.script_hashes.insert(script_hash) {
-                                    // Send to electrum
-                                    client.send_event_request(ScriptHashSubscribe {
-                                        script_hash,
-                                    })?;
-                                }
-                            }
-                            Command::ScriptHashUnsubscribe(script_hash) => {
-                                // Remove it
-                                // Return true if is successfully removed
-                                // If returns false, it was never subscribed, so there is no reason to send unsubscribe
-                                if services_tracker.script_hashes.remove(&script_hash) {
-                                    // Send to electrum
-                                    client.send_event_request(ScriptHashUnsubscribe {
-                                        script_hash,
-                                    })?;
-                                }
-                            }
-                            Command::GetHistory(script_hash) => {
-                                // Send to electrum
-                                client.send_event_request(GetHistory {
-                                    script_hash,
-                                })?;
-                            }
-                            Command::GetTransaction { txid } => {
-                                client.send_event_request(GetTx { txid })?;
-                            }
-                        }
-                    }
+                // Batch request receiver
+                Some(batch_request) = rx_batch_request.recv() => {
+                    client.send_batch(batch_request)?;
                 }
                 // Ping channel receiver
                 _ = self.channels.ping.notified() => {
@@ -534,18 +481,22 @@ impl ElectrumClient {
         mut receiver: AsyncEventReceiver,
     ) -> Result<(), Error> {
         while let Some(event) = receiver.next().await {
-            // Send event notification
-            self.send_notification(InternalNotification::Event(event.clone()), false);
-
             let notification: Option<ElectrumNotification> = match event {
                 Event::Response(res) => match res {
                     SatisfiedRequest::HeadersSubscribe { resp, .. } => {
+                        // Mark as subscribed
+                        self.traker.set_headers_subscribed(true);
+
                         Some(ElectrumNotification::BlockHeader {
                             height: resp.height,
                             header: resp.header,
                         })
                     }
                     SatisfiedRequest::ScriptHashSubscribe { req, resp } => {
+                        // Mark as subscribed
+                        let mut script_hashes_set = self.traker.script_hashes.write().await;
+                        script_hashes_set.insert(req.script_hash);
+
                         Some(ElectrumNotification::ScriptHash {
                             hash: req.script_hash,
                             status: resp,
@@ -577,7 +528,7 @@ impl ElectrumClient {
 
             // Send notification, if any.
             if let Some(notification) = notification {
-                self.send_notification(InternalNotification::Notification(notification), true);
+                self.send_notification(notification);
             }
         }
 
@@ -609,67 +560,44 @@ impl ElectrumClient {
         self.set_status(ElectrumConnectionStatus::Terminated, true);
 
         // Shutdown all notification loops
-        self.send_notification(
-            InternalNotification::Notification(ElectrumNotification::Shutdown),
-            true,
-        );
+        self.send_notification(ElectrumNotification::Shutdown);
     }
 
     #[inline]
-    fn send_command(&self, command: Command) -> Result<(), Error> {
-        self.batch_commands(vec![command])
-    }
-
-    #[inline]
-    fn batch_commands(&self, commands: Vec<Command>) -> Result<(), Error> {
+    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
         self.channels
             .commands
             .0
-            .try_send(commands)
+            .try_send(batch)
             .map_err(|e| Error::MpscCommandTrySend(e.to_string()))
     }
 
     pub async fn block_header(&self, height: u32) -> Result<Header, Error> {
-        // Subscribe to notifications
-        let mut notifications = self.internal_notifications.subscribe();
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(GetBlockHeader { height });
 
-        // Send command
-        self.send_command(Command::BlockHeader { height })?;
+        self.send_batch(batch)?;
 
-        // Wait for response
-        handle_notification_events(&mut notifications, |event| {
-            match event {
-                Event::Response(SatisfiedRequest::Header { req, resp }) => {
-                    if req.height == height {
-                        return Some(Ok(resp.header));
-                    }
-                }
-                Event::ResponseError(ErroredRequest::Header { req, error }) => {
-                    if req.height == height {
-                        return Some(Err(Error::Response(error)));
-                    }
-                }
-                _ => {}
-            }
-            None
-        })
-        .await
+        let resp = fut.await?;
+        Ok(resp.header)
     }
 
     /// Subscribe to headers
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     pub fn subscribe_headers(&self) -> Result<(), Error> {
-        self.send_command(Command::HeadersSubscribe)?;
+        let mut batch = AsyncBatchRequest::new();
+        batch.event_request(HeadersSubscribe);
+        self.send_batch(batch)?;
         Ok(())
     }
 
     /// Subscribe to script hash
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
+    #[inline]
     pub fn subscribe_script_hash(&self, script_hash: ElectrumScriptHash) -> Result<(), Error> {
-        self.send_command(Command::ScriptHashSubscribe(script_hash))?;
-        Ok(())
+        self.batch_subscribe_script_hashes(vec![script_hash])
     }
 
     /// Subscribe to script hashes
@@ -679,76 +607,75 @@ impl ElectrumClient {
     where
         I: IntoIterator<Item = ElectrumScriptHash>,
     {
-        let commands: Vec<Command> = script_hashes
-            .into_iter()
-            .map(Command::ScriptHashSubscribe)
-            .collect();
-        self.batch_commands(commands)?;
+        let mut batch = AsyncBatchRequest::new();
+
+        for script_hash in script_hashes {
+            batch.event_request(ScriptHashSubscribe { script_hash });
+        }
+
+        self.send_batch(batch)?;
+
         Ok(())
     }
 
     /// Unsubscribe from a script hash
     pub fn unsubscribe_script_hash(&self, script_hash: ElectrumScriptHash) -> Result<(), Error> {
-        self.send_command(Command::ScriptHashUnsubscribe(script_hash))?;
+        let mut batch = AsyncBatchRequest::new();
+        batch.event_request(ScriptHashUnsubscribe { script_hash });
+        self.send_batch(batch)?;
         Ok(())
     }
 
     /// Request history for scripts
-    pub async fn script_get_history(&self, script: &Script) -> Result<Vec<Tx>, Error> {
-        let script_hash = ElectrumScriptHash::new(script);
+    pub async fn script_get_history(
+        &self,
+        script_hash: ElectrumScriptHash,
+    ) -> Result<Vec<Tx>, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(GetHistory { script_hash });
 
-        // Subscribe to notifications
-        let mut notifications = self.internal_notifications.subscribe();
+        self.send_batch(batch)?;
 
-        // Send command
-        self.send_command(Command::GetHistory(script_hash))?;
+        Ok(fut.await?)
+    }
 
-        // Wait for response
-        handle_notification_events(&mut notifications, |event| {
-            match event {
-                Event::Response(SatisfiedRequest::GetHistory { req, resp }) => {
-                    if req.script_hash == script_hash {
-                        return Some(Ok(resp));
-                    }
-                }
-                Event::ResponseError(ErroredRequest::GetHistory { req, error }) => {
-                    if req.script_hash == script_hash {
-                        return Some(Err(Error::Response(error)));
-                    }
-                }
-                _ => {}
+    pub async fn batch_script_get_history<I>(&self, script_hashes: I) -> Result<Vec<Vec<Tx>>, Error>
+    where
+        I: IntoIterator<Item = ElectrumScriptHash>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+
+        let mut futures = Vec::new();
+
+        for script_hash in script_hashes {
+            let fut = batch.request(GetHistory { script_hash });
+            futures.push(fut);
+        }
+
+        self.send_batch(batch)?;
+
+        let list = future::join_all(futures).await;
+
+        let mut output = Vec::new();
+
+        for res in list.into_iter() {
+            if let Ok(txs) = res {
+                output.push(txs);
             }
-            None
-        })
-        .await
+        }
+
+        Ok(output)
     }
 
     /// Request history for scripts
     pub async fn get_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
-        // Subscribe to notifications
-        let mut notifications = self.internal_notifications.subscribe();
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(GetTx { txid });
 
-        // Send command
-        self.send_command(Command::GetTransaction { txid })?;
+        self.send_batch(batch)?;
 
-        // Wait for response
-        handle_notification_events(&mut notifications, |event| {
-            match event {
-                Event::Response(SatisfiedRequest::GetTx { req, resp }) => {
-                    if req.txid == txid {
-                        return Some(Ok(resp.tx));
-                    }
-                }
-                Event::ResponseError(ErroredRequest::GetTx { req, error }) => {
-                    if req.txid == txid {
-                        return Some(Err(Error::Response(error)));
-                    }
-                }
-                _ => {}
-            }
-            None
-        })
-        .await
+        let resp = fut.await?;
+        Ok(resp.tx)
     }
 }
 
@@ -814,33 +741,4 @@ where
     Ok(time::timeout(timeout, client.send_request(req))
         .await
         .map_err(|_| Error::Timeout)??)
-}
-
-async fn handle_notification_events<F, T>(
-    notifications: &mut broadcast::Receiver<InternalNotification>,
-    func: F,
-) -> Result<T, Error>
-where
-    F: Fn(Event) -> Option<Result<T, Error>>,
-{
-    while let Ok(notification) = notifications.recv().await {
-        match notification {
-            InternalNotification::Event(event) => {
-                if let Some(output) = func(event) {
-                    return output;
-                }
-            }
-            InternalNotification::Notification(notification) => match notification {
-                ElectrumNotification::ConnectionStatusChanged(status) => {
-                    if status.is_disconnected() {
-                        return Err(Error::Disconnected);
-                    }
-                }
-                ElectrumNotification::Shutdown => break,
-                _ => {}
-            },
-        }
-    }
-
-    Err(Error::PrematureExit)
 }
