@@ -85,9 +85,10 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ConnectionConfig {
-    mode: ElectrumConnectionMode,
-    timeout: Duration,
+struct Config {
+    connection_mode: ElectrumConnectionMode,
+    connection_timeout: Duration,
+    request_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -164,7 +165,7 @@ pub struct ElectrumClient {
     channels: Arc<Channels>,
     traker: Arc<ServicesTracker>,
     notification_sender: broadcast::Sender<ElectrumNotification>,
-    config: ConnectionConfig,
+    config: Config,
 }
 
 impl ElectrumClient {
@@ -190,9 +191,10 @@ impl ElectrumClient {
             channels: Arc::new(Channels::new()),
             traker: Arc::new(ServicesTracker::default()),
             notification_sender,
-            config: ConnectionConfig {
-                mode: builder.connection_mode,
-                timeout: builder.connection_timeout,
+            config: Config {
+                connection_mode: builder.connection_mode,
+                connection_timeout: builder.connection_timeout,
+                request_timeout: builder.request_timeout,
             },
         }
     }
@@ -356,10 +358,7 @@ impl ElectrumClient {
         self.channels.terminate.notified().await;
     }
 
-    async fn _try_connect(
-        &self,
-        timeout: Duration,
-    ) -> Result<(BoxReadStream, BoxWriteStream), Error> {
+    async fn _try_connect(&self) -> Result<(BoxReadStream, BoxWriteStream), Error> {
         // Update status
         self.set_status(ElectrumConnectionStatus::Connecting, true);
 
@@ -368,7 +367,7 @@ impl ElectrumClient {
         // At this stem is NOT required to close the WebSocket connection.
         tokio::select! {
             // Connect
-            res = connect(&self.addr, self.config.mode, timeout) => match res {
+            res = connect(&self.addr, self.config.connection_mode, self.config.connection_timeout) => match res {
                 Ok((reader, writer)) => {
                     // Update status
                     self.set_status(ElectrumConnectionStatus::Connected, true);
@@ -393,7 +392,7 @@ impl ElectrumClient {
         &self,
         rx_batch_requests: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) {
-        match self._try_connect(self.config.timeout).await {
+        match self._try_connect().await {
             // Connection success, go to post-connection stage
             Ok((reader, writer)) => {
                 self.post_connection(reader, writer, rx_batch_requests)
@@ -606,7 +605,9 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = fut.await?;
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(resp.header)
     }
 
@@ -624,7 +625,9 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = fut.await?;
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(BlockHeaders::from(resp))
     }
 
@@ -634,8 +637,13 @@ impl ElectrumClient {
     pub async fn get_tip(&self) -> Result<BlockHeader, Error> {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(HeadersSubscribe);
+
         self.send_batch(batch)?;
-        Ok(BlockHeader::from(fut.await?))
+
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+        Ok(BlockHeader::from(resp))
     }
 
     /// Subscribe to block headers
@@ -705,7 +713,10 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        Ok(fut.await?)
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+        Ok(resp)
     }
 
     /// Batch get history for scripts
@@ -730,7 +741,9 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let list = future::join_all(futures).await;
+        let list = time::timeout(self.config.request_timeout, future::join_all(futures))
+            .await
+            .map_err(|_| Error::Timeout)?;
 
         let mut output = Vec::new();
 
@@ -748,7 +761,9 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = fut.await?;
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(resp.tx)
     }
 
@@ -763,7 +778,10 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        Ok(TransactionMerkel::from(fut.await?))
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+        Ok(TransactionMerkel::from(resp))
     }
 }
 

@@ -4,7 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use super::constant::{DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE};
+use super::constant::{
+    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_REQUEST_TIMEOUT,
+};
 use crate::address::ElectrumServerAddress;
 use crate::client::ElectrumClient;
 
@@ -24,10 +26,12 @@ pub enum ElectrumConnectionMode {
 pub struct ElectrumClientBuilder {
     /// Electrum server address
     pub addr: ElectrumServerAddress,
-    /// Connection timeout
-    pub connection_timeout: Duration,
     /// Connection mode
     pub connection_mode: ElectrumConnectionMode,
+    /// Connection timeout
+    pub connection_timeout: Duration,
+    /// Request timeout
+    pub request_timeout: Duration,
     /// Notification channel size
     pub notification_channel_size: usize,
 }
@@ -38,10 +42,18 @@ impl ElectrumClientBuilder {
     pub fn new(addr: ElectrumServerAddress) -> Self {
         Self {
             addr,
-            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             connection_mode: ElectrumConnectionMode::default(),
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             notification_channel_size: DEFAULT_NOTIFICATION_CHANNEL_SIZE,
         }
+    }
+
+    /// Set a connection mode
+    #[inline]
+    pub fn connection_mode(mut self, mode: ElectrumConnectionMode) -> Self {
+        self.connection_mode = mode;
+        self
     }
 
     /// Set a custom connection timeout (default: 60 secs)
@@ -51,10 +63,10 @@ impl ElectrumClientBuilder {
         self
     }
 
-    /// Set a connection mode
+    /// Set a custom request timeout (default: 60 secs)
     #[inline]
-    pub fn connection_mode(mut self, mode: ElectrumConnectionMode) -> Self {
-        self.connection_mode = mode;
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
