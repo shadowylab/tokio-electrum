@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "bdk-tokio-electrum",
     "tokio-electrum",
 ]
 default-members = ["tokio-electrum"]
@@ -10,3 +11,6 @@ authors = ["Yuki Kishimoto <yukikishimoto@protonmail.com>"]
 homepage = "https://github.com/shadowylab/tokio-electrum"
 repository = "https://github.com/shadowylab/tokio-electrum.git"
 license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", default-features = false }

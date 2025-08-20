@@ -1,0 +1,13 @@
+[package]
+name = "bdk-tokio-electrum"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+bdk_core = "0.6"
+tokio = { workspace = true, features = ["sync"] }
+tokio-electrum = { path = "../tokio-electrum", version = "0.1" }
