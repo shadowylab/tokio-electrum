@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bitcoin::block::Header;
@@ -19,17 +19,17 @@ use electrum_streaming_client::{
     AsyncPendingRequestTuple, AsyncRequestError, AsyncRequestSendError, BatchRequestError, Event,
     Request, ResponseError, SatisfiedRequest,
 };
-use futures::{future, StreamExt};
+use futures::{StreamExt, future};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard, Notify, RwLock};
+use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, broadcast, mpsc};
 use tokio::time;
+use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
 use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
 use crate::config::ElectrumConfig;
