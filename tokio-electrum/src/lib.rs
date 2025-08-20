@@ -6,8 +6,8 @@
 #![warn(rustdoc::bare_urls)]
 
 pub mod address;
+pub mod builder;
 pub mod client;
-pub mod config;
 mod constant;
 pub mod notification;
 pub mod prelude;

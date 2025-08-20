@@ -34,7 +34,7 @@ use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
-use crate::config::{ElectrumConfig, ElectrumConnectionMode};
+use crate::builder::{ElectrumClientBuilder, ElectrumConnectionMode};
 use crate::constant::PING_INTERVAL;
 use crate::notification::ElectrumNotification;
 #[cfg(feature = "socks")]
@@ -82,6 +82,12 @@ pub enum Error {
     /// Termination request
     #[error("termination request")]
     TerminationRequest,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionConfig {
+    mode: ElectrumConnectionMode,
+    timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -158,28 +164,36 @@ pub struct ElectrumClient {
     channels: Arc<Channels>,
     traker: Arc<ServicesTracker>,
     notification_sender: broadcast::Sender<ElectrumNotification>,
-    config: ElectrumConfig,
+    config: ConnectionConfig,
 }
 
 impl ElectrumClient {
     /// Construct a new electrum client
     #[inline]
     pub fn new(addr: ElectrumServerAddress) -> Self {
-        Self::with_config(addr, ElectrumConfig::default())
+        Self::builder(addr).build()
     }
 
-    /// Construct a new electrum client
-    pub fn with_config(addr: ElectrumServerAddress, config: ElectrumConfig) -> Self {
-        let (notification_sender, ..) = broadcast::channel(config.notification_channel_size);
+    /// Construct a new electrum client builder
+    #[inline]
+    pub fn builder(addr: ElectrumServerAddress) -> ElectrumClientBuilder {
+        ElectrumClientBuilder::new(addr)
+    }
+
+    pub(crate) fn from_builder(builder: ElectrumClientBuilder) -> Self {
+        let (notification_sender, ..) = broadcast::channel(builder.notification_channel_size);
 
         Self {
-            addr,
+            addr: builder.addr,
             status: Arc::new(AtomicElectrumConnectionStatus::default()),
             running: Arc::new(AtomicBool::new(false)),
             channels: Arc::new(Channels::new()),
             traker: Arc::new(ServicesTracker::default()),
             notification_sender,
-            config,
+            config: ConnectionConfig {
+                mode: builder.connection_mode,
+                timeout: builder.connection_timeout,
+            },
         }
     }
 
@@ -354,7 +368,7 @@ impl ElectrumClient {
         // At this stem is NOT required to close the WebSocket connection.
         tokio::select! {
             // Connect
-            res = connect(&self.addr, self.config.connection_mode, timeout) => match res {
+            res = connect(&self.addr, self.config.mode, timeout) => match res {
                 Ok((reader, writer)) => {
                     // Update status
                     self.set_status(ElectrumConnectionStatus::Connected, true);
@@ -379,7 +393,7 @@ impl ElectrumClient {
         &self,
         rx_batch_requests: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) {
-        match self._try_connect(self.config.connection_timeout).await {
+        match self._try_connect(self.config.timeout).await {
             // Connection success, go to post-connection stage
             Ok((reader, writer)) => {
                 self.post_connection(reader, writer, rx_batch_requests)
