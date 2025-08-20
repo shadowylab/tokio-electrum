@@ -8,7 +8,7 @@ use bitcoin::block::Header;
 use bitcoin::{Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, HeadersSubscribe, Ping,
+    GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, Headers, HeadersSubscribe, Ping,
     ScriptHashSubscribe, ScriptHashUnsubscribe,
 };
 use electrum_streaming_client::response::Tx;
@@ -34,7 +34,7 @@ use crate::config::ElectrumConfig;
 use crate::constant::PING_INTERVAL;
 use crate::notification::ElectrumNotification;
 use crate::status::{AtomicElectrumConnectionStatus, ElectrumConnectionStatus};
-use crate::types::{BlockHeader, ElectrumScriptHash, TransactionMerkel};
+use crate::types::{BlockHeader, BlockHeaders, ElectrumScriptHash, TransactionMerkel};
 
 type BoxReadStream = Box<dyn AsyncRead + Send + Unpin>;
 type BoxWriteStream = Box<dyn AsyncWrite + Send + Unpin>;
@@ -582,6 +582,24 @@ impl ElectrumClient {
         Ok(resp.header)
     }
 
+    /// Tries to fetch `count` block headers starting from `start_height`.
+    pub async fn block_headers(
+        &self,
+        start_height: u32,
+        count: usize,
+    ) -> Result<BlockHeaders, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(Headers {
+            start_height,
+            count,
+        });
+
+        self.send_batch(batch)?;
+
+        let resp = fut.await?;
+        Ok(BlockHeaders::from(resp))
+    }
+
     /// Subscribe to block headers and return the current blockchain tip.
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
@@ -687,10 +705,8 @@ impl ElectrumClient {
 
         let mut output = Vec::new();
 
-        for res in list.into_iter() {
-            if let Ok(txs) = res {
-                output.push(txs);
-            }
+        for txs in list.into_iter().flatten() {
+            output.push(txs);
         }
 
         Ok(output)

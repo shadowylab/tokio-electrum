@@ -2,7 +2,7 @@ use bitcoin::absolute::Height;
 use bitcoin::block::Header;
 use bitcoin::hashes::sha256d::Hash as Sha256d;
 pub use electrum_streaming_client::response::Tx;
-use electrum_streaming_client::response::{HeadersSubscribeResp, TxMerkle};
+use electrum_streaming_client::response::{HeadersResp, HeadersSubscribeResp, TxMerkle};
 pub use electrum_streaming_client::{ElectrumScriptHash, ElectrumScriptStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -18,6 +18,26 @@ impl From<HeadersSubscribeResp> for BlockHeader {
         Self {
             height: headers_subscribe_resp.height,
             header: headers_subscribe_resp.header,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockHeaders {
+    /// The number of headers returned.
+    pub count: usize,
+    /// The deserialized headers returned by the server.
+    pub headers: Vec<Header>,
+    /// The server’s maximum allowed headers per request.
+    pub max: usize,
+}
+
+impl From<HeadersResp> for BlockHeaders {
+    fn from(headers_resp: HeadersResp) -> Self {
+        Self {
+            count: headers_resp.count,
+            headers: headers_resp.headers,
+            max: headers_resp.max,
         }
     }
 }
