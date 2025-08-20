@@ -1,3 +1,5 @@
+//! Electrum notifications
+
 use bitcoin::block::Header;
 
 use crate::status::ElectrumConnectionStatus;

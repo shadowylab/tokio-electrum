@@ -1,3 +1,5 @@
+//! Electrum client
+
 use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +62,9 @@ pub enum Error {
     /// Response error
     #[error(transparent)]
     Response(#[from] ResponseError),
+    /// MPSC try send error
     #[error("{0}")]
-    MpscCommandTrySend(String),
+    MpscTrySend(String),
     /// Timeout
     #[error("timeout")]
     Timeout,
@@ -138,6 +141,7 @@ impl ServicesTracker {
     }
 }
 
+/// Electrum client
 #[derive(Debug, Clone)]
 pub struct ElectrumClient {
     addr: ElectrumServerAddress,
@@ -545,6 +549,7 @@ impl ElectrumClient {
         }
     }
 
+    /// Terminate connection with the electrum server
     pub fn disconnect(&self) {
         let status = self.status();
 
@@ -569,9 +574,10 @@ impl ElectrumClient {
             .commands
             .0
             .try_send(batch)
-            .map_err(|e| Error::MpscCommandTrySend(e.to_string()))
+            .map_err(|e| Error::MpscTrySend(e.to_string()))
     }
 
+    /// Get block header
     pub async fn block_header(&self, height: u32) -> Result<Header, Error> {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetBlockHeader { height });
@@ -680,6 +686,7 @@ impl ElectrumClient {
         Ok(fut.await?)
     }
 
+    /// Batch get history for scripts
     pub async fn batch_script_get_history<I, T>(
         &self,
         script_hashes: I,

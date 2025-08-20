@@ -1,3 +1,5 @@
+//! Electrum types
+
 use bitcoin::absolute::Height;
 use bitcoin::block::Header;
 use bitcoin::hashes::sha256d::Hash as Sha256d;
@@ -5,6 +7,7 @@ pub use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::response::{HeadersResp, HeadersSubscribeResp, TxMerkle};
 pub use electrum_streaming_client::{ElectrumScriptHash, ElectrumScriptStatus};
 
+/// Block header with height.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockHeader {
     /// Block header.
@@ -22,6 +25,7 @@ impl From<HeadersSubscribeResp> for BlockHeader {
     }
 }
 
+/// Block headers.
 #[derive(Debug, Clone)]
 pub struct BlockHeaders {
     /// The number of headers returned.
@@ -42,6 +46,7 @@ impl From<HeadersResp> for BlockHeaders {
     }
 }
 
+/// Transaction Merkle.
 pub struct TransactionMerkel {
     /// The height of the block containing the transaction.
     pub block_height: Height,

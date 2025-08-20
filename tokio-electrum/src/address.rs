@@ -1,3 +1,5 @@
+//! Electrum server address
+
 use std::fmt;
 use std::net::IpAddr;
 use std::num::ParseIntError;
@@ -145,6 +147,7 @@ impl HostAndPort {
     }
 }
 
+/// Electrum server address
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ElectrumServerAddress {
     scheme: Scheme,

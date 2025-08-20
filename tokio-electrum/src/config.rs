@@ -1,3 +1,5 @@
+//! Electrum client configs
+
 use std::time::Duration;
 
 use super::constant::{DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE};
