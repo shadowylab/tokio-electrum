@@ -8,7 +8,7 @@ use bdk_core::spk_client::{
 };
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use tokio::sync::Mutex;
-use tokio_electrum::client::{ElectrumClient, Error};
+pub use tokio_electrum::client::{ElectrumClient, Error};
 use tokio_electrum::types::BlockHeader;
 
 use crate::util;
