@@ -636,34 +636,24 @@ impl ElectrumClient {
         // Send command
         self.send_command(Command::BlockHeader { height })?;
 
-        while let Ok(notification) = notifications.recv().await {
-            match notification {
-                InternalNotification::Event(event) => match event {
-                    Event::Response(SatisfiedRequest::Header { req, resp }) => {
-                        if req.height == height {
-                            return Ok(resp.header);
-                        }
+        // Wait for response
+        handle_notification_events(&mut notifications, |event| {
+            match event {
+                Event::Response(SatisfiedRequest::Header { req, resp }) => {
+                    if req.height == height {
+                        return Some(Ok(resp.header));
                     }
-                    Event::ResponseError(ErroredRequest::Header { req, error }) => {
-                        if req.height == height {
-                            return Err(Error::Response(error));
-                        }
+                }
+                Event::ResponseError(ErroredRequest::Header { req, error }) => {
+                    if req.height == height {
+                        return Some(Err(Error::Response(error)));
                     }
-                    _ => {}
-                },
-                InternalNotification::Notification(notification) => match notification {
-                    ElectrumNotification::ConnectionStatusChanged(status) => {
-                        if status.is_disconnected() {
-                            return Err(Error::Disconnected);
-                        }
-                    }
-                    ElectrumNotification::Shutdown => break,
-                    _ => {}
-                },
+                }
+                _ => {}
             }
-        }
-
-        Err(Error::PrematureExit)
+            None
+        })
+        .await
     }
 
     /// Subscribe to headers
@@ -704,11 +694,7 @@ impl ElectrumClient {
     }
 
     /// Request history for scripts
-    pub async fn script_get_history(
-        &self,
-        script: &Script,
-        timeout: Duration,
-    ) -> Result<Vec<Tx>, Error> {
+    pub async fn script_get_history(&self, script: &Script) -> Result<Vec<Tx>, Error> {
         let script_hash = ElectrumScriptHash::new(script);
 
         // Subscribe to notifications
@@ -718,46 +704,27 @@ impl ElectrumClient {
         self.send_command(Command::GetHistory(script_hash))?;
 
         // Wait for response
-        time::timeout(timeout, async {
-            while let Ok(notification) = notifications.recv().await {
-                match notification {
-                    InternalNotification::Event(event) => match event {
-                        Event::Response(SatisfiedRequest::GetHistory { req, resp }) => {
-                            if req.script_hash == script_hash {
-                                return Ok(resp);
-                            }
-                        }
-                        Event::ResponseError(ErroredRequest::GetHistory { req, error }) => {
-                            if req.script_hash == script_hash {
-                                return Err(Error::Response(error));
-                            }
-                        }
-                        _ => {}
-                    },
-                    InternalNotification::Notification(notification) => match notification {
-                        ElectrumNotification::ConnectionStatusChanged(status) => {
-                            if status.is_disconnected() {
-                                return Err(Error::Disconnected);
-                            }
-                        }
-                        ElectrumNotification::Shutdown => break,
-                        _ => {}
-                    },
+        handle_notification_events(&mut notifications, |event| {
+            match event {
+                Event::Response(SatisfiedRequest::GetHistory { req, resp }) => {
+                    if req.script_hash == script_hash {
+                        return Some(Ok(resp));
+                    }
                 }
+                Event::ResponseError(ErroredRequest::GetHistory { req, error }) => {
+                    if req.script_hash == script_hash {
+                        return Some(Err(Error::Response(error)));
+                    }
+                }
+                _ => {}
             }
-
-            Err(Error::PrematureExit)
+            None
         })
         .await
-        .map_err(|_| Error::Timeout)?
     }
 
     /// Request history for scripts
-    pub async fn get_transaction(
-        &self,
-        txid: Txid,
-        timeout: Duration,
-    ) -> Result<Transaction, Error> {
+    pub async fn get_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
         // Subscribe to notifications
         let mut notifications = self.internal_notifications.subscribe();
 
@@ -765,38 +732,23 @@ impl ElectrumClient {
         self.send_command(Command::GetTransaction { txid })?;
 
         // Wait for response
-        time::timeout(timeout, async {
-            while let Ok(notification) = notifications.recv().await {
-                match notification {
-                    InternalNotification::Event(event) => match event {
-                        Event::Response(SatisfiedRequest::GetTx { req, resp }) => {
-                            if req.txid == txid {
-                                return Ok(resp.tx);
-                            }
-                        }
-                        Event::ResponseError(ErroredRequest::GetTx { req, error }) => {
-                            if req.txid == txid {
-                                return Err(Error::Response(error));
-                            }
-                        }
-                        _ => {}
-                    },
-                    InternalNotification::Notification(notification) => match notification {
-                        ElectrumNotification::ConnectionStatusChanged(status) => {
-                            if status.is_disconnected() {
-                                return Err(Error::Disconnected);
-                            }
-                        }
-                        ElectrumNotification::Shutdown => break,
-                        _ => {}
-                    },
+        handle_notification_events(&mut notifications, |event| {
+            match event {
+                Event::Response(SatisfiedRequest::GetTx { req, resp }) => {
+                    if req.txid == txid {
+                        return Some(Ok(resp.tx));
+                    }
                 }
+                Event::ResponseError(ErroredRequest::GetTx { req, error }) => {
+                    if req.txid == txid {
+                        return Some(Err(Error::Response(error)));
+                    }
+                }
+                _ => {}
             }
-
-            Err(Error::PrematureExit)
+            None
         })
         .await
-        .map_err(|_| Error::Timeout)?
     }
 }
 
@@ -862,4 +814,33 @@ where
     Ok(time::timeout(timeout, client.send_request(req))
         .await
         .map_err(|_| Error::Timeout)??)
+}
+
+async fn handle_notification_events<F, T>(
+    notifications: &mut broadcast::Receiver<InternalNotification>,
+    func: F,
+) -> Result<T, Error>
+where
+    F: Fn(Event) -> Option<Result<T, Error>>,
+{
+    while let Ok(notification) = notifications.recv().await {
+        match notification {
+            InternalNotification::Event(event) => {
+                if let Some(output) = func(event) {
+                    return output;
+                }
+            }
+            InternalNotification::Notification(notification) => match notification {
+                ElectrumNotification::ConnectionStatusChanged(status) => {
+                    if status.is_disconnected() {
+                        return Err(Error::Disconnected);
+                    }
+                }
+                ElectrumNotification::Shutdown => break,
+                _ => {}
+            },
+        }
+    }
+
+    Err(Error::PrematureExit)
 }

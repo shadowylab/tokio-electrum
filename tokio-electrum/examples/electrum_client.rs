@@ -22,10 +22,7 @@ async fn main() {
     let address = Address::from_str("1DWYVT2Db2ct7dG4Wf6bBD9yVhvsWhJWYj").unwrap();
     let address = address.require_network(Network::Bitcoin).unwrap();
     let script = address.script_pubkey();
-    let txs = client
-        .script_get_history(&script, Duration::from_secs(10))
-        .await
-        .unwrap();
+    let txs = client.script_get_history(&script).await.unwrap();
     println!("{:?}", txs);
 
     // Subscribe to notifications
