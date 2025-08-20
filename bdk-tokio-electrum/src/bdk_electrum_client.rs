@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use bdk_core::bitcoin::block::Header;
@@ -20,11 +21,20 @@ const CHAIN_SUFFIX_LENGTH: u32 = 8;
 /// transaction cache to avoid re-fetching already downloaded transactions.
 #[derive(Debug)]
 pub struct BdkElectrumClient {
+    /// The underlying electrum client.
     inner: ElectrumClient,
     /// The transaction cache
     tx_cache: Mutex<HashMap<Txid, Arc<Transaction>>>,
     /// The header cache
     block_header_cache: Mutex<HashMap<u32, Header>>,
+}
+
+impl Deref for BdkElectrumClient {
+    type Target = ElectrumClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl BdkElectrumClient {
