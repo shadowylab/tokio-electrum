@@ -1,10 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{Address, Network};
-use electrum_streaming_client::ElectrumScriptHash;
-use tokio_electrum::address::ElectrumServerAddress;
-use tokio_electrum::client::ElectrumClient;
-use tokio_electrum::notification::ElectrumNotification;
+use tokio_electrum::prelude::*;
 
 #[tokio::main]
 async fn main() {
