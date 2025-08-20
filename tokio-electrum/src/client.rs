@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, broadcast, mpsc};
 use tokio::time;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::crypto::ring;
 use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
@@ -900,6 +901,9 @@ async fn ssl_connector<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Install ring provider
+    let _ = ring::default_provider().install_default();
+
     // Create TLS configuration
     let mut root_cert_store: RootCertStore = RootCertStore::empty();
     root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
