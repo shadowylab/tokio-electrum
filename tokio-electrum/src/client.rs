@@ -12,10 +12,11 @@ use bitcoin::block::Header;
 use bitcoin::{Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    BroadcastTx, GetHistory, GetTx, GetTxMerkle, Header as GetBlockHeader, Headers,
-    HeadersSubscribe, Ping, ScriptHashSubscribe, ScriptHashUnsubscribe,
+    BroadcastTx, Features as GetServerFeatures, GetHistory, GetTx, GetTxMerkle,
+    Header as GetBlockHeader, Headers, HeadersSubscribe, Ping, ScriptHashSubscribe,
+    ScriptHashUnsubscribe,
 };
-use electrum_streaming_client::response::Tx;
+use electrum_streaming_client::response::{ServerFeatures, Tx};
 use electrum_streaming_client::{
     AsyncBatchRequest, AsyncClient, AsyncEventReceiver, AsyncPendingRequest,
     AsyncPendingRequestTuple, AsyncRequestError, AsyncRequestSendError, BatchRequestError, Event,
@@ -604,6 +605,19 @@ impl ElectrumClient {
             .0
             .try_send(batch)
             .map_err(|e| Error::MpscTrySend(e.to_string()))
+    }
+
+    /// Get server features
+    pub async fn server_features(&self) -> Result<ServerFeatures, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(GetServerFeatures);
+
+        self.send_batch(batch)?;
+
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+        Ok(resp)
     }
 
     /// Get block header

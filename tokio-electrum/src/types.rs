@@ -3,8 +3,8 @@
 use bitcoin::absolute::Height;
 use bitcoin::block::Header;
 use bitcoin::hashes::sha256d::Hash as Sha256d;
-pub use electrum_streaming_client::response::Tx;
 use electrum_streaming_client::response::{HeadersResp, HeadersSubscribeResp, TxMerkle};
+pub use electrum_streaming_client::response::{ServerFeatures, Tx};
 pub use electrum_streaming_client::{ElectrumScriptHash, ElectrumScriptStatus};
 
 /// Block header with height.
