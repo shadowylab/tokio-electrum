@@ -4,6 +4,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use bitcoin::Network;
+
 use super::constant::{
     DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_REQUEST_TIMEOUT,
 };
@@ -34,6 +36,10 @@ pub struct ElectrumClientBuilder {
     pub request_timeout: Duration,
     /// Notification channel size
     pub notification_channel_size: usize,
+    /// Expected Bitcoin network
+    ///
+    /// When specified, the client will verify that the server operates on the same network during connection.
+    pub expected_network: Option<Network>,
 }
 
 impl ElectrumClientBuilder {
@@ -46,6 +52,7 @@ impl ElectrumClientBuilder {
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             notification_channel_size: DEFAULT_NOTIFICATION_CHANNEL_SIZE,
+            expected_network: None,
         }
     }
 
@@ -74,6 +81,14 @@ impl ElectrumClientBuilder {
     #[inline]
     pub fn notification_channel_size(mut self, size: usize) -> Self {
         self.notification_channel_size = size;
+        self
+    }
+
+    /// Expected Bitcoin network
+    ///
+    /// When specified, the client will verify that the server operates on the same network during connection.
+    pub fn expected_network(mut self, network: Network) -> Self {
+        self.expected_network = Some(network);
         self
     }
 

@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bitcoin::block::Header;
-use bitcoin::{FeeRate, Transaction, Txid};
+use bitcoin::constants::ChainHash;
+use bitcoin::{FeeRate, Network, Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
     BroadcastTx, EstimateFee, Features as GetServerFeatures, GetHistory, GetTx, GetTxMerkle,
@@ -75,6 +76,14 @@ pub enum Error {
     /// MPSC try send error
     #[error("{0}")]
     MpscTrySend(String),
+    /// Network mismatch
+    #[error("network mismatch (expected: {expected}, found: {found:?})")]
+    NetworkMismatch {
+        /// Expected network
+        expected: Network,
+        /// Found network
+        found: Option<Network>,
+    },
     /// Timeout
     #[error("timeout")]
     Timeout,
@@ -91,6 +100,7 @@ struct Config {
     connection_mode: ElectrumConnectionMode,
     connection_timeout: Duration,
     request_timeout: Duration,
+    expected_network: Option<Network>,
 }
 
 #[derive(Debug)]
@@ -197,6 +207,7 @@ impl ElectrumClient {
                 connection_mode: builder.connection_mode,
                 connection_timeout: builder.connection_timeout,
                 request_timeout: builder.request_timeout,
+                expected_network: builder.expected_network,
             },
         }
     }
@@ -484,6 +495,10 @@ impl ElectrumClient {
         client: &AsyncClient,
         rx_batch_request: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) -> Result<(), Error> {
+        // Validate the network before start processing the requests
+        self.validate_network(client).await?;
+
+        // Start the receiver loop
         loop {
             tokio::select! {
                 // Batch request receiver
@@ -605,6 +620,27 @@ impl ElectrumClient {
             .0
             .try_send(batch)
             .map_err(|e| Error::MpscTrySend(e.to_string()))
+    }
+
+    async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
+        // Validate network
+        if let Some(expected_network) = self.config.expected_network {
+            let features: ServerFeatures =
+                send_request_with_timeout(client, Duration::from_secs(10), GetServerFeatures)
+                    .await?;
+
+            let server_chain_hash: ChainHash =
+                ChainHash::from_genesis_block_hash(features.genesis_hash);
+
+            if server_chain_hash != expected_network.chain_hash() {
+                return Err(Error::NetworkMismatch {
+                    expected: expected_network,
+                    found: Network::from_chain_hash(server_chain_hash),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Get server features
