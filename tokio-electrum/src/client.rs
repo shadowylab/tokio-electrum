@@ -77,13 +77,8 @@ pub enum Error {
     #[error("{0}")]
     MpscTrySend(String),
     /// Network mismatch
-    #[error("network mismatch (expected: {expected}, found: {found:?})")]
-    NetworkMismatch {
-        /// Expected network
-        expected: Network,
-        /// Found network
-        found: Option<Network>,
-    },
+    #[error("the server network does not match the expected network")]
+    NetworkMismatch,
     /// Timeout
     #[error("timeout")]
     Timeout,
@@ -150,11 +145,22 @@ impl Channels {
 
 #[derive(Debug, Default)]
 struct ServicesTracker {
+    network_mismatch: AtomicBool,
     headers_subscribed: AtomicBool,
     script_hashes: RwLock<HashSet<ElectrumScriptHash>>,
 }
 
 impl ServicesTracker {
+    #[inline]
+    fn network_mismatch(&self) -> bool {
+        self.network_mismatch.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn set_network_mismatch(&self, value: bool) {
+        self.network_mismatch.store(value, Ordering::SeqCst);
+    }
+
     #[inline]
     fn is_headers_subscribed(&self) -> bool {
         self.headers_subscribed.load(Ordering::SeqCst)
@@ -623,15 +629,6 @@ impl ElectrumClient {
         self.send_notification(ElectrumNotification::Shutdown);
     }
 
-    #[inline]
-    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
-        self.channels
-            .commands
-            .0
-            .try_send(batch)
-            .map_err(|e| Error::MpscTrySend(e.to_string()))
-    }
-
     async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
         // Validate network
         if let Some(expected_network) = self.config.expected_network {
@@ -643,14 +640,28 @@ impl ElectrumClient {
                 ChainHash::from_genesis_block_hash(features.genesis_hash);
 
             if server_chain_hash != expected_network.chain_hash() {
-                return Err(Error::NetworkMismatch {
-                    expected: expected_network,
-                    found: Network::from_chain_hash(server_chain_hash),
-                });
+                // Set network mismatch
+                self.traker.set_network_mismatch(true);
+
+                // Return error
+                return Err(Error::NetworkMismatch);
             }
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
+        if self.traker.network_mismatch() {
+            return Err(Error::NetworkMismatch);
+        }
+
+        self.channels
+            .commands
+            .0
+            .try_send(batch)
+            .map_err(|e| Error::MpscTrySend(e.to_string()))
     }
 
     async fn wait_batch_response<F>(&self, fut: F) -> Result<F::Output, Error>
