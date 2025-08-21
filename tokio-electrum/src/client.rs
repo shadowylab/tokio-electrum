@@ -643,6 +643,9 @@ impl ElectrumClient {
                 // Set network mismatch
                 self.traker.set_network_mismatch(true);
 
+                // Mark as terminated
+                self.set_status(ElectrumConnectionStatus::Terminated, true);
+
                 // Return error
                 return Err(Error::NetworkMismatch);
             }
