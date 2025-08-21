@@ -110,6 +110,7 @@ struct Channels {
         Mutex<Receiver<AsyncBatchRequest>>,
     ),
     ping: Notify,
+    disconnected: Notify,
     terminate: Notify,
 }
 
@@ -121,6 +122,7 @@ impl Channels {
         Self {
             commands: (tx, rx),
             ping: Notify::new(),
+            disconnected: Notify::new(),
             terminate: Notify::new(),
         }
     }
@@ -133,6 +135,11 @@ impl Channels {
     #[inline]
     pub fn ping(&self) {
         self.ping.notify_one()
+    }
+
+    #[inline]
+    pub fn disconnected(&self) {
+        self.disconnected.notify_waiters()
     }
 
     #[inline]
@@ -486,6 +493,9 @@ impl ElectrumClient {
             _ = self.pinger() => {}
         }
 
+        // Notify disconnection
+        self.channels.disconnected();
+
         // Close
         client.close();
     }
@@ -643,6 +653,21 @@ impl ElectrumClient {
         Ok(())
     }
 
+    async fn wait_batch_response<F>(&self, fut: F) -> Result<F::Output, Error>
+    where
+        F: IntoFuture,
+    {
+        tokio::select! {
+            resp = time::timeout(self.config.request_timeout, fut) => {
+                match resp {
+                    Ok(resp) => Ok(resp),
+                    Err(_) => Err(Error::Timeout)
+                }
+            }
+            _ = self.channels.disconnected.notified() => Err(Error::Disconnected),
+        }
+    }
+
     /// Get server features
     pub async fn server_features(&self) -> Result<ServerFeatures, Error> {
         let mut batch = AsyncBatchRequest::new();
@@ -650,9 +675,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(resp)
     }
 
@@ -663,9 +687,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(resp.header)
     }
 
@@ -683,9 +706,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(BlockHeaders::from(resp))
     }
 
@@ -698,9 +720,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(BlockHeader::from(resp))
     }
 
@@ -771,9 +792,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(resp)
     }
 
@@ -799,13 +819,11 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let list = time::timeout(self.config.request_timeout, future::join_all(futures))
-            .await
-            .map_err(|_| Error::Timeout)?;
+        let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
         let mut output = Vec::new();
 
-        for txs in list.into_iter().flatten() {
+        for txs in resp.into_iter().flatten() {
             output.push(txs);
         }
 
@@ -819,9 +837,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(resp.tx)
     }
 
@@ -836,9 +853,8 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
+
         Ok(TransactionMerkel::from(resp))
     }
 
@@ -851,9 +867,7 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
 
         Ok(resp.fee_rate)
     }
@@ -876,13 +890,11 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let list = time::timeout(self.config.request_timeout, future::join_all(futures))
-            .await
-            .map_err(|_| Error::Timeout)?;
+        let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
         let mut output = BTreeMap::new();
 
-        for (res, num) in list.into_iter().zip(indexes) {
+        for (res, num) in resp.into_iter().zip(indexes) {
             if let Ok(Some(fee)) = res.map(|res| res.fee_rate) {
                 output.insert(num, fee);
             }
@@ -898,9 +910,7 @@ impl ElectrumClient {
 
         self.send_batch(batch)?;
 
-        let resp = time::timeout(self.config.request_timeout, fut)
-            .await
-            .map_err(|_| Error::Timeout)??;
+        let resp = self.wait_batch_response(fut).await??;
 
         Ok(resp)
     }
