@@ -1,6 +1,6 @@
 //! Electrum client
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bitcoin::block::Header;
-use bitcoin::{Transaction, Txid};
+use bitcoin::{FeeRate, Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
-    BroadcastTx, Features as GetServerFeatures, GetHistory, GetTx, GetTxMerkle,
+    BroadcastTx, EstimateFee, Features as GetServerFeatures, GetHistory, GetTx, GetTxMerkle,
     Header as GetBlockHeader, Headers, HeadersSubscribe, Ping, ScriptHashSubscribe,
     ScriptHashUnsubscribe,
 };
@@ -804,6 +804,55 @@ impl ElectrumClient {
             .await
             .map_err(|_| Error::Timeout)??;
         Ok(TransactionMerkel::from(resp))
+    }
+
+    /// Return the estimated transaction fee for a transaction to be confirmed within a certain number of blocks.
+    ///
+    /// Returns `None` if the server could not estimate.
+    pub async fn estimate_fee(&self, number: usize) -> Result<Option<FeeRate>, Error> {
+        let mut batch = AsyncBatchRequest::new();
+        let fut = batch.request(EstimateFee { number });
+
+        self.send_batch(batch)?;
+
+        let resp = time::timeout(self.config.request_timeout, fut)
+            .await
+            .map_err(|_| Error::Timeout)??;
+
+        Ok(resp.fee_rate)
+    }
+
+    /// Return the estimated transaction fees for a transaction to be confirmed within a certain number of blocks.
+    pub async fn batch_estimate_fee<I>(&self, blocks: I) -> Result<BTreeMap<usize, FeeRate>, Error>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+
+        let mut indexes = Vec::new();
+        let mut futures = Vec::new();
+
+        for number in blocks.into_iter() {
+            let fut = batch.request(EstimateFee { number });
+            indexes.push(number);
+            futures.push(fut);
+        }
+
+        self.send_batch(batch)?;
+
+        let list = time::timeout(self.config.request_timeout, future::join_all(futures))
+            .await
+            .map_err(|_| Error::Timeout)?;
+
+        let mut output = BTreeMap::new();
+
+        for (res, num) in list.into_iter().zip(indexes) {
+            if let Ok(Some(fee)) = res.map(|res| res.fee_rate) {
+                output.insert(num, fee);
+            }
+        }
+
+        Ok(output)
     }
 
     /// Broadcast a transaction
