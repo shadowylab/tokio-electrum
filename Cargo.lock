@@ -254,7 +254,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 [[package]]
 name = "electrum_streaming_client"
 version = "0.4.0"
-source = "git+https://github.com/bitcoindevkit/electrum_streaming_client?rev=d384cf2fa9640f0dbd7be25964b686ece6c92976#d384cf2fa9640f0dbd7be25964b686ece6c92976"
+source = "git+https://github.com/yukibtc/electrum_streaming_client?branch=missing-features-req-patch#ee8ebcfece2dfd5d6fae1139c72de519269787a8"
 dependencies = [
  "bitcoin",
  "futures",
