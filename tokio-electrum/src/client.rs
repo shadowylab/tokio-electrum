@@ -5,7 +5,7 @@ use std::io;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bitcoin::block::Header;
@@ -181,63 +181,21 @@ impl ServicesTracker {
     }
 }
 
-/// Electrum client
-#[derive(Debug, Clone)]
-pub struct ElectrumClient {
+#[derive(Debug)]
+struct InnerClient {
     addr: ElectrumServerAddress,
-    status: Arc<AtomicElectrumConnectionStatus>,
-    running: Arc<AtomicBool>,
-    channels: Arc<Channels>,
-    traker: Arc<ServicesTracker>,
+    status: AtomicElectrumConnectionStatus,
+    running: AtomicBool,
+    channels: Channels,
+    tracker: ServicesTracker,
     notification_sender: broadcast::Sender<ElectrumNotification>,
     config: Config,
 }
 
-impl ElectrumClient {
-    /// Construct a new electrum client
-    #[inline]
-    pub fn new(addr: ElectrumServerAddress) -> Self {
-        Self::builder(addr).build()
-    }
-
-    /// Construct a new electrum client builder
-    #[inline]
-    pub fn builder(addr: ElectrumServerAddress) -> ElectrumClientBuilder {
-        ElectrumClientBuilder::new(addr)
-    }
-
-    pub(crate) fn from_builder(builder: ElectrumClientBuilder) -> Self {
-        let (notification_sender, ..) = broadcast::channel(builder.notification_channel_size);
-
-        Self {
-            addr: builder.addr,
-            status: Arc::new(AtomicElectrumConnectionStatus::default()),
-            running: Arc::new(AtomicBool::new(false)),
-            channels: Arc::new(Channels::new()),
-            traker: Arc::new(ServicesTracker::default()),
-            notification_sender,
-            config: Config {
-                connection_mode: builder.connection_mode,
-                connection_timeout: builder.connection_timeout,
-                request_timeout: builder.request_timeout,
-                expected_network: builder.expected_network,
-            },
-        }
-    }
-
-    /// Check if the connection task is running
+impl InnerClient {
     #[inline]
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
-    }
-
-    /// Subscribe to notifications
-    ///
-    /// When you call this method, you subscribe to the notifications channel from that precise moment.
-    /// Anything received by client before that moment is not included in the channel!
-    #[inline]
-    pub fn notifications(&self) -> broadcast::Receiver<ElectrumNotification> {
-        self.notification_sender.subscribe()
     }
 
     #[inline]
@@ -245,9 +203,8 @@ impl ElectrumClient {
         let _ = self.notification_sender.send(notification);
     }
 
-    /// Get the current connection status
     #[inline]
-    pub fn status(&self) -> ElectrumConnectionStatus {
+    fn status(&self) -> ElectrumConnectionStatus {
         self.status.load()
     }
 
@@ -283,40 +240,39 @@ impl ElectrumClient {
         self.send_notification(ElectrumNotification::ConnectionStatusChanged(status));
     }
 
-    /// Connect to the electrum server and keep the connection alive.
-    ///
-    /// This automatically reconnects in case of disconnection.
-    pub fn connect(&self) {
-        // Immediately return if can't connect
-        if !self.status().can_connect() {
-            return;
+    async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
+        // Validate network
+        if let Some(expected_network) = self.config.expected_network {
+            let features: ServerFeatures =
+                send_request_with_timeout(client, Duration::from_secs(10), GetServerFeatures)
+                    .await?;
+
+            let server_chain_hash: ChainHash =
+                ChainHash::from_genesis_block_hash(features.genesis_hash);
+
+            if server_chain_hash != expected_network.chain_hash() {
+                // Set network mismatch
+                self.tracker.set_network_mismatch(true);
+
+                // Mark as terminated
+                self.set_status(ElectrumConnectionStatus::Terminated, true);
+
+                // Return error
+                return Err(Error::NetworkMismatch);
+            }
         }
 
-        // Update status
-        // Change it to pending to avoid issues with the health check (initialized check)
-        self.set_status(ElectrumConnectionStatus::Pending, false);
-
-        // Spawn connection task
-        self.spawn_connection_task();
+        Ok(())
     }
 
-    fn spawn_connection_task(&self) {
-        // Check if the connection task is already running
-        // This is checked also later, but it's checked also here to avoid a full-clone if we know that is already running.
-        if self.is_running() {
-            tracing::warn!(addr = %self.addr, "Electrum connection task is already running.");
-            return;
-        }
-
-        // Full-clone
-        let client = self.clone();
-
-        // Spawn task
-        tokio::spawn(client.connection_task());
+    #[inline]
+    async fn handle_terminate(&self) {
+        // Wait to be notified
+        self.channels.terminate.notified().await;
     }
 
     /// This **MUST** be called only by the [`Self::spawn_connection_task`] method!
-    async fn connection_task(self) {
+    async fn connection_task(self: Arc<Self>) {
         // Set the connection task as running and get the previous value.
         let is_running: bool = self.running.swap(true, Ordering::SeqCst);
 
@@ -329,7 +285,7 @@ impl ElectrumClient {
         }
 
         // Reset service tracker
-        self.traker.reset().await;
+        self.tracker.reset().await;
 
         // Lock receiver
         let mut rx_batch_requests = self.channels.rx_batch_requests().await;
@@ -348,7 +304,7 @@ impl ElectrumClient {
                 break;
             }
 
-            // Check if the relay is marked as disconnected. If not, update status.
+            // Check if the client is marked as disconnected. If not, update status.
             // Check if disconnected to avoid a possible double log
             if !status.is_disconnected() {
                 self.set_status(ElectrumConnectionStatus::Disconnected, true);
@@ -376,12 +332,6 @@ impl ElectrumClient {
         self.running.store(false, Ordering::SeqCst);
 
         tracing::debug!(addr = %self.addr, "Auto connect loop terminated.");
-    }
-
-    #[inline]
-    async fn handle_terminate(&self) {
-        // Wait to be notified
-        self.channels.terminate.notified().await;
     }
 
     async fn _try_connect(&self) -> Result<(BoxReadStream, BoxWriteStream), Error> {
@@ -443,7 +393,7 @@ impl ElectrumClient {
         let (client, receiver, worker) = AsyncClient::new_tokio(reader, writer);
 
         // If the header subscription was enabled, resubscribe.
-        if self.traker.is_headers_subscribed() {
+        if self.tracker.is_headers_subscribed() {
             tracing::debug!(addr = %self.addr, "Resubscribing to headers.");
 
             let mut batch = AsyncBatchRequest::new();
@@ -456,7 +406,7 @@ impl ElectrumClient {
 
         {
             // Acquire read lock
-            let script_hashes = self.traker.script_hashes.read().await;
+            let script_hashes = self.tracker.script_hashes.read().await;
 
             // If are cached any script hashes, resubscribe.
             if !script_hashes.is_empty() {
@@ -543,7 +493,7 @@ impl ElectrumClient {
                 Event::Response(res) => match res {
                     SatisfiedRequest::HeadersSubscribe { resp, .. } => {
                         // Mark as subscribed
-                        self.traker.set_headers_subscribed(true);
+                        self.tracker.set_headers_subscribed(true);
 
                         Some(ElectrumNotification::BlockHeader {
                             height: resp.height,
@@ -552,7 +502,7 @@ impl ElectrumClient {
                     }
                     SatisfiedRequest::ScriptHashSubscribe { req, resp } => {
                         // Mark as subscribed
-                        let mut script_hashes_set = self.traker.script_hashes.write().await;
+                        let mut script_hashes_set = self.tracker.script_hashes.write().await;
                         script_hashes_set.insert(req.script_hash);
 
                         Some(ElectrumNotification::ScriptHash {
@@ -562,7 +512,7 @@ impl ElectrumClient {
                     }
                     SatisfiedRequest::ScriptHashUnsubscribe { req, .. } => {
                         // Mark as unsubscribed
-                        let mut script_hashes_set = self.traker.script_hashes.write().await;
+                        let mut script_hashes_set = self.tracker.script_hashes.write().await;
                         script_hashes_set.remove(&req.script_hash);
 
                         None
@@ -610,6 +560,136 @@ impl ElectrumClient {
         }
     }
 
+    #[inline]
+    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
+        if self.tracker.network_mismatch() {
+            return Err(Error::NetworkMismatch);
+        }
+
+        self.channels
+            .commands
+            .0
+            .try_send(batch)
+            .map_err(|e| Error::MpscTrySend(e.to_string()))
+    }
+}
+
+/// Electrum client
+#[derive(Debug)]
+pub struct ElectrumClient {
+    inner: Arc<InnerClient>,
+    atomic_counter: Arc<AtomicUsize>,
+}
+
+impl Clone for ElectrumClient {
+    fn clone(&self) -> Self {
+        self.atomic_counter.fetch_add(1, Ordering::SeqCst);
+
+        Self {
+            inner: self.inner.clone(),
+            atomic_counter: self.atomic_counter.clone(),
+        }
+    }
+}
+
+impl Drop for ElectrumClient {
+    fn drop(&mut self) {
+        // Shutdown exactly once when the last client handle is dropped.
+        if self.atomic_counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.disconnect();
+        }
+    }
+}
+
+impl ElectrumClient {
+    /// Construct a new electrum client
+    #[inline]
+    pub fn new(addr: ElectrumServerAddress) -> Self {
+        Self::builder(addr).build()
+    }
+
+    /// Construct a new electrum client builder
+    #[inline]
+    pub fn builder(addr: ElectrumServerAddress) -> ElectrumClientBuilder {
+        ElectrumClientBuilder::new(addr)
+    }
+
+    pub(crate) fn from_builder(builder: ElectrumClientBuilder) -> Self {
+        let (notification_sender, ..) = broadcast::channel(builder.notification_channel_size);
+
+        Self {
+            inner: Arc::new(InnerClient {
+                addr: builder.addr,
+                status: AtomicElectrumConnectionStatus::default(),
+                running: AtomicBool::new(false),
+                channels: Channels::new(),
+                tracker: ServicesTracker::default(),
+                notification_sender,
+                config: Config {
+                    connection_mode: builder.connection_mode,
+                    connection_timeout: builder.connection_timeout,
+                    request_timeout: builder.request_timeout,
+                    expected_network: builder.expected_network,
+                },
+            }),
+            atomic_counter: Arc::new(AtomicUsize::new(1)),
+        }
+    }
+
+    /// Check if the connection task is running
+    #[inline]
+    fn is_running(&self) -> bool {
+        self.inner.is_running()
+    }
+
+    /// Subscribe to notifications
+    ///
+    /// When you call this method, you subscribe to the notifications channel from that precise moment.
+    /// Anything received by client before that moment is not included in the channel!
+    #[inline]
+    pub fn notifications(&self) -> broadcast::Receiver<ElectrumNotification> {
+        self.inner.notification_sender.subscribe()
+    }
+
+    /// Get the current connection status
+    #[inline]
+    pub fn status(&self) -> ElectrumConnectionStatus {
+        self.inner.status()
+    }
+
+    /// Connect to the electrum server and keep the connection alive.
+    ///
+    /// This automatically reconnects in case of disconnection.
+    pub fn connect(&self) {
+        // Immediately return if can't connect
+        if !self.status().can_connect() {
+            return;
+        }
+
+        // Update status
+        // Change it to pending to avoid issues with the health check (initialized check)
+        self.inner
+            .set_status(ElectrumConnectionStatus::Pending, false);
+
+        // Spawn connection task
+        self.spawn_connection_task();
+    }
+
+    fn spawn_connection_task(&self) {
+        // Check if the connection task is already running
+        // This is checked also later, but it's checked also here to avoid a full-clone if we know that is already running.
+        if self.is_running() {
+            tracing::warn!(addr = %self.inner.addr, "Electrum connection task is already running.");
+            return;
+        }
+
+        // Full-clone of the inner client
+        let client: Arc<InnerClient> = self.inner.clone();
+
+        // Spawn task
+        tokio::spawn(client.connection_task());
+    }
+
     /// Terminate connection with the electrum server
     pub fn disconnect(&self) {
         let status = self.status();
@@ -620,51 +700,14 @@ impl ElectrumClient {
         }
 
         // Notify termination
-        self.channels.terminate();
+        self.inner.channels.terminate();
 
         // Update status
-        self.set_status(ElectrumConnectionStatus::Terminated, true);
+        self.inner
+            .set_status(ElectrumConnectionStatus::Terminated, true);
 
         // Shutdown all notification loops
-        self.send_notification(ElectrumNotification::Shutdown);
-    }
-
-    async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
-        // Validate network
-        if let Some(expected_network) = self.config.expected_network {
-            let features: ServerFeatures =
-                send_request_with_timeout(client, Duration::from_secs(10), GetServerFeatures)
-                    .await?;
-
-            let server_chain_hash: ChainHash =
-                ChainHash::from_genesis_block_hash(features.genesis_hash);
-
-            if server_chain_hash != expected_network.chain_hash() {
-                // Set network mismatch
-                self.traker.set_network_mismatch(true);
-
-                // Mark as terminated
-                self.set_status(ElectrumConnectionStatus::Terminated, true);
-
-                // Return error
-                return Err(Error::NetworkMismatch);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
-        if self.traker.network_mismatch() {
-            return Err(Error::NetworkMismatch);
-        }
-
-        self.channels
-            .commands
-            .0
-            .try_send(batch)
-            .map_err(|e| Error::MpscTrySend(e.to_string()))
+        self.inner.send_notification(ElectrumNotification::Shutdown);
     }
 
     async fn wait_batch_response<F>(&self, fut: F) -> Result<F::Output, Error>
@@ -672,13 +715,13 @@ impl ElectrumClient {
         F: IntoFuture,
     {
         tokio::select! {
-            resp = time::timeout(self.config.request_timeout, fut) => {
+            resp = time::timeout(self.inner.config.request_timeout, fut) => {
                 match resp {
                     Ok(resp) => Ok(resp),
                     Err(_) => Err(Error::Timeout)
                 }
             }
-            _ = self.channels.disconnected.notified() => Err(Error::Disconnected),
+            _ = self.inner.channels.disconnected.notified() => Err(Error::Disconnected),
         }
     }
 
@@ -687,7 +730,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetServerFeatures);
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -699,7 +742,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetBlockHeader { height });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -718,7 +761,7 @@ impl ElectrumClient {
             count,
         });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -732,7 +775,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(HeadersSubscribe);
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -745,7 +788,7 @@ impl ElectrumClient {
     pub fn block_headers_subscribe(&self) -> Result<(), Error> {
         let mut batch = AsyncBatchRequest::new();
         batch.event_request(HeadersSubscribe);
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
         Ok(())
     }
 
@@ -776,7 +819,7 @@ impl ElectrumClient {
             });
         }
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         Ok(())
     }
@@ -790,7 +833,7 @@ impl ElectrumClient {
         batch.event_request(ScriptHashUnsubscribe {
             script_hash: script_hash.into(),
         });
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
         Ok(())
     }
 
@@ -804,7 +847,7 @@ impl ElectrumClient {
             script_hash: script_hash.into(),
         });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -831,7 +874,7 @@ impl ElectrumClient {
             futures.push(fut);
         }
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
@@ -849,7 +892,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetTx { txid });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -865,7 +908,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetTxMerkle { txid, height });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -879,7 +922,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(EstimateFee { number });
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -902,7 +945,7 @@ impl ElectrumClient {
             futures.push(fut);
         }
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
@@ -922,7 +965,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(BroadcastTx(tx));
 
-        self.send_batch(batch)?;
+        self.inner.send_batch(batch)?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -1059,4 +1102,53 @@ where
     Ok(time::timeout(timeout, client.send_request(req))
         .await
         .map_err(|_| Error::Timeout)??)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> ElectrumClient {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        ElectrumClient::new(addr)
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_on_drop() {
+        let inner: Arc<InnerClient> = {
+            let client: ElectrumClient = test_client();
+
+            client.connect();
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            assert!(client.is_running());
+
+            // Clone the inner client
+            let inner: Arc<InnerClient> = client.inner.clone();
+
+            {
+                let c2: ElectrumClient = client.clone();
+                tokio::spawn(async move {
+                    assert_eq!(c2.atomic_counter.load(Ordering::SeqCst), 2);
+
+                    time::sleep(Duration::from_secs(1)).await;
+
+                    // c2 dropped here
+                });
+            }
+
+            time::sleep(Duration::from_secs(3)).await;
+
+            assert!(client.is_running());
+            assert_eq!(client.atomic_counter.load(Ordering::SeqCst), 1);
+
+            inner
+        }; // client dropped here
+
+        time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(inner.status(), ElectrumConnectionStatus::Terminated);
+        assert!(!inner.is_running());
+    }
 }
