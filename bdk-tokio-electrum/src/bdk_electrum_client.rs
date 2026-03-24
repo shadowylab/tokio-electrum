@@ -8,14 +8,80 @@ use bdk_core::spk_client::{
     FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncRequest, SyncResponse,
 };
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::sync::Mutex;
 pub use tokio_electrum::client::{ElectrumClient, Error};
-use tokio_electrum::types::BlockHeader;
+use tokio_electrum::notification::ElectrumNotification;
+use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::util;
 
 /// We include a chain suffix of a certain length for the purpose of robustness.
 const CHAIN_SUFFIX_LENGTH: u32 = 8;
+
+/// Information about a subscribed script
+#[derive(Debug, Clone)]
+struct ScriptSubscription {
+    /// The set of transaction IDs we've seen for this script
+    expected_txids: HashSet<Txid>,
+}
+
+impl ScriptSubscription {
+    #[inline]
+    fn new(expected_txids: HashSet<Txid>) -> Self {
+        Self { expected_txids }
+    }
+}
+
+/// Tracks script subscriptions with their expected txids for diffing updates
+#[derive(Debug, Clone, Default)]
+struct SubscriptionTracker {
+    /// Maps script hash to subscription information
+    scripts: Arc<Mutex<HashMap<ElectrumScriptHash, ScriptSubscription>>>,
+}
+
+struct SubscriptionCtx<K> {
+    request: Mutex<FullScanRequest<K>>,
+    subscribed_scripts: Mutex<HashSet<ElectrumScriptHash>>,
+    script_to_keychain_index: Mutex<HashMap<ElectrumScriptHash, (K, u32)>>,
+    last_active_indices: Mutex<BTreeMap<K, u32>>,
+    chain_tip: Mutex<Option<CheckPoint>>,
+}
+
+impl<K> SubscriptionCtx<K>
+where
+    K: Ord + Clone,
+{
+    async fn has_script(&self, hash: &ElectrumScriptHash) -> bool {
+        let scripts_guard = self.subscribed_scripts.lock().await;
+        scripts_guard.contains(hash)
+    }
+
+    async fn keychain_index(&self, hash: &ElectrumScriptHash) -> Option<(K, u32)> {
+        let lookup = self.script_to_keychain_index.lock().await;
+        lookup.get(hash).cloned()
+    }
+
+    async fn needs_extension(&self, hash: &ElectrumScriptHash) -> Option<(K, u32)> {
+        let (keychain, current_index) = self.keychain_index(hash).await?;
+
+        // Check if we need to extend subscriptions for this keychain
+        let last_active = self.last_active_indices.lock().await;
+        let last: u32 = last_active.get(&keychain).copied().unwrap_or(0);
+
+        if current_index > last {
+            Some((keychain, current_index))
+        } else {
+            None
+        }
+    }
+}
+
+/// A stream that yields real-time updates from Electrum subscriptions.
+pub type SubscriptionStream =
+    BoxStream<'static, Result<SyncResponse<ConfirmationBlockTime>, Error>>;
 
 /// Wrapper around [`ElectrumClient`] which includes an internal in-memory
 /// transaction cache to avoid re-fetching already downloaded transactions.
@@ -27,6 +93,8 @@ pub struct BdkElectrumClient {
     tx_cache: Arc<Mutex<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
     block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
+    /// Subscription tracker for real-time sync
+    subscription_tracker: SubscriptionTracker,
 }
 
 impl Deref for BdkElectrumClient {
@@ -44,6 +112,7 @@ impl BdkElectrumClient {
             inner: client,
             tx_cache: Default::default(),
             block_header_cache: Default::default(),
+            subscription_tracker: Default::default(),
         }
     }
 
@@ -66,9 +135,7 @@ impl BdkElectrumClient {
     /// Fetch transaction of given `txid`.
     ///
     /// If it hits the cache it will return the cached version and avoid making the request.
-    // TODO: move cache to tokio-electrum?
-    // TODO: add timeout?
-    pub async fn fetch_tx(&self, txid: Txid) -> Result<Arc<Transaction>, Error> {
+    async fn fetch_tx(&self, txid: Txid) -> Result<Arc<Transaction>, Error> {
         let mut tx_cache = self.tx_cache.lock().await;
 
         if let Some(tx) = tx_cache.get(&txid) {
@@ -108,6 +175,74 @@ impl BdkElectrumClient {
         Ok(header)
     }
 
+    /// Internal implementation of full scan that optionally subscribes to scripts.
+    ///
+    /// When `subscribe` is true, it subscribes to all scripts with history and returns their hashes.
+    async fn internal_full_scan<K: Ord + Clone>(
+        &self,
+        request: &mut FullScanRequest<K>,
+        stop_gap: usize,
+        batch_size: usize,
+        fetch_prev_txouts: bool,
+        subscribe: bool,
+    ) -> Result<(FullScanResponse<K>, HashSet<ElectrumScriptHash>), Error> {
+        let start_time = request.start_time();
+
+        let tip_and_latest_blocks = match request.chain_tip() {
+            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip).await?),
+            None => None,
+        };
+
+        let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
+        let mut last_active_indices: BTreeMap<K, u32> = BTreeMap::default();
+        let mut all_subscribed_scripts: HashSet<ElectrumScriptHash> = HashSet::new();
+
+        for keychain in request.keychains() {
+            let spks = request
+                .iter_spks(keychain.clone())
+                .map(|(spk_i, spk)| (spk_i, SpkWithExpectedTxids::from(spk)));
+            let (last_active_index, subscribed_hashes) = self
+                .populate_with_spks(
+                    start_time,
+                    &mut tx_update,
+                    spks,
+                    stop_gap,
+                    batch_size,
+                    subscribe,
+                )
+                .await?;
+
+            if let Some(last_active_index) = last_active_index {
+                last_active_indices.insert(keychain, last_active_index);
+            }
+
+            // Collect all subscribed script hashes
+            all_subscribed_scripts.extend(subscribed_hashes);
+        }
+
+        // Fetch previous `TxOut`s for fee calculation if flag is enabled.
+        if fetch_prev_txouts {
+            self.fetch_prev_txout(&mut tx_update).await?;
+        }
+
+        let chain_update = match tip_and_latest_blocks {
+            Some((chain_tip, latest_blocks)) => Some(chain_update(
+                chain_tip,
+                &latest_blocks,
+                tx_update.anchors.iter().cloned(),
+            )?),
+            _ => None,
+        };
+
+        let response = FullScanResponse {
+            tx_update,
+            chain_update,
+            last_active_indices,
+        };
+
+        Ok((response, all_subscribed_scripts))
+    }
+
     /// Full scan the keychain scripts specified with the blockchain (via an Electrum client) and
     /// returns updates for [`bdk_chain`] data structures.
     ///
@@ -136,46 +271,44 @@ impl BdkElectrumClient {
         fetch_prev_txouts: bool,
     ) -> Result<FullScanResponse<K>, Error> {
         let mut request: FullScanRequest<K> = request.into();
-        let start_time = request.start_time();
+        let (response, _) = self
+            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, false)
+            .await?;
+        Ok(response)
+    }
 
-        let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip).await?),
-            None => None,
-        };
+    /// Full scan the keychain scripts with real-time subscription support.
+    ///
+    /// This method performs the same initial scan as [`full_scan`](Self::full_scan), but additionally
+    /// subscribes to each script pubkey that has transaction history. It returns both the initial
+    /// scan results and a stream of real-time updates.
+    pub async fn full_scan_and_subscribe<K>(
+        &self,
+        request: impl Into<FullScanRequest<K>>,
+        stop_gap: usize,
+        batch_size: usize,
+        fetch_prev_txouts: bool,
+    ) -> Result<(FullScanResponse<K>, SubscriptionStream), Error>
+    where
+        K: Ord + Clone + Send + 'static,
+    {
+        let mut request = request.into();
 
-        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
-        let mut last_active_indices = BTreeMap::<K, u32>::default();
-        for keychain in request.keychains() {
-            let spks = request
-                .iter_spks(keychain.clone())
-                .map(|(spk_i, spk)| (spk_i, SpkWithExpectedTxids::from(spk)));
-            if let Some(last_active_index) = self
-                .populate_with_spks(start_time, &mut tx_update, spks, stop_gap, batch_size)
-                .await?
-            {
-                last_active_indices.insert(keychain, last_active_index);
-            }
-        }
+        let (response, all_subscribed_scripts) = self
+            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, true)
+            .await?;
 
-        // Fetch previous `TxOut`s for fee calculation if flag is enabled.
-        if fetch_prev_txouts {
-            self.fetch_prev_txout(&mut tx_update).await?;
-        }
+        // Create the update stream with only the subscribed scripts
+        let stream = self.create_subscription_stream(
+            request.start_time(),
+            all_subscribed_scripts,
+            fetch_prev_txouts,
+            request,
+            &response,
+            stop_gap,
+        );
 
-        let chain_update = match tip_and_latest_blocks {
-            Some((chain_tip, latest_blocks)) => Some(chain_update(
-                chain_tip,
-                &latest_blocks,
-                tx_update.anchors.iter().cloned(),
-            )?),
-            _ => None,
-        };
-
-        Ok(FullScanResponse {
-            tx_update,
-            chain_update,
-            last_active_indices,
-        })
+        Ok((response, stream))
     }
 
     /// Sync a set of scripts with the blockchain (via an Electrum client) for the data specified
@@ -200,8 +333,6 @@ impl BdkElectrumClient {
     /// [`CalculateFeeError::MissingTxOut`]: ../bdk_chain/tx_graph/enum.CalculateFeeError.html#variant.MissingTxOut
     /// [`Wallet.calculate_fee`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee
     /// [`Wallet.calculate_fee_rate`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee_rate
-    // TODO: remove this and replace with real time updates
-    // TODO: instead of calling sync every X secs, use subscribe to scripts and use a channel to notify when to upgrade the
     pub async fn sync<I: 'static>(
         &self,
         request: impl Into<SyncRequest<I>>,
@@ -226,6 +357,7 @@ impl BdkElectrumClient {
                 .map(|(i, spk)| (i as u32, spk)),
             usize::MAX,
             batch_size,
+            false,
         )
         .await?;
         self.populate_with_txids(start_time, &mut tx_update, request.iter_txids())
@@ -253,11 +385,258 @@ impl BdkElectrumClient {
         })
     }
 
+    /// Creates a stream that processes script hash and block header notifications.
+    fn create_subscription_stream<K>(
+        &self,
+        start_time: u64,
+        subscribed_scripts: HashSet<ElectrumScriptHash>,
+        fetch_prev_txouts: bool,
+        mut request: FullScanRequest<K>,
+        response: &FullScanResponse<K>,
+        stop_gap: usize,
+    ) -> SubscriptionStream
+    where
+        K: Ord + Clone + Send + 'static,
+    {
+        let client = self.clone();
+        let notification_rx = self.inner.notifications();
+
+        // Build a reverse lookup map
+        let script_to_keychain_index = build_reverse_lookup_map(&mut request, response, stop_gap);
+
+        let ctx = Arc::new(SubscriptionCtx {
+            request: Mutex::new(request),
+            subscribed_scripts: Mutex::new(subscribed_scripts),
+            script_to_keychain_index: Mutex::new(script_to_keychain_index),
+            last_active_indices: Mutex::new(response.last_active_indices.clone()),
+            chain_tip: Mutex::new(response.chain_update.clone()),
+        });
+
+        let stream = BroadcastStream::new(notification_rx).filter_map(move |result| {
+            let client: BdkElectrumClient = client.clone();
+            let ctx: Arc<SubscriptionCtx<K>> = ctx.clone();
+
+            async move {
+                match result {
+                    Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
+                        client
+                            .handle_script_hash_notification(
+                                hash,
+                                start_time,
+                                fetch_prev_txouts,
+                                stop_gap,
+                                &ctx,
+                            )
+                            .await
+                    }
+                    Ok(ElectrumNotification::BlockHeader { height, header }) => {
+                        handle_block_header_notification(height, header, &ctx).await
+                    }
+                    Ok(ElectrumNotification::Shutdown) => {
+                        tracing::warn!("Electrum connection shutdown notification received");
+                        None
+                    }
+                    Ok(_) => None,  // Ignore other notifications
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        tracing::warn!("Subscription stream lagged behind by {} messages - some updates may have been missed", n);
+                        None
+                    }
+                }
+            }
+        });
+
+        Box::pin(stream)
+    }
+
+    /// Handle script hash notification and check if we need to subscribe to new addresses
+    async fn handle_script_hash_notification<K>(
+        &self,
+        hash: ElectrumScriptHash,
+        start_time: u64,
+        fetch_prev_txouts: bool,
+        stop_gap: usize,
+        ctx: &SubscriptionCtx<K>,
+    ) -> Option<Result<SyncResponse<ConfirmationBlockTime>, Error>>
+    where
+        K: Ord + Clone,
+    {
+        // Check if this script hash belongs to this wallet
+        let has_script: bool = ctx.has_script(&hash).await;
+
+        if !has_script {
+            return None;
+        }
+
+        if let Some((keychain, current_index)) = ctx.needs_extension(&hash).await {
+            // Subscribe to new addresses incrementally
+            if let Err(e) = self
+                .subscribe_incremental(keychain, current_index, stop_gap, ctx)
+                .await
+            {
+                tracing::error!("Failed to subscribe incrementally: {}", e);
+            }
+        }
+
+        // Process this script hash update
+        match self
+            .process_script_hash_update(hash, start_time, fetch_prev_txouts)
+            .await
+        {
+            Ok(Some(update)) => Some(Ok(update)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Subscribe incrementally to new addresses when a transaction is detected on a higher index.
+    ///
+    /// This maintains the stop_gap invariant by subscribing to addresses from the new
+    /// last_active_index up to last_active_index + stop_gap.
+    async fn subscribe_incremental<K>(
+        &self,
+        keychain: K,
+        new_active_index: u32,
+        stop_gap: usize,
+        ctx: &SubscriptionCtx<K>,
+    ) -> Result<(), Error>
+    where
+        K: Ord + Clone,
+    {
+        // Derive scripts to subscribe from new_active_index + 1 to new_active_index + stop_gap
+        let scripts_to_subscribe: Vec<(ElectrumScriptHash, ScriptSubscription, u32)> = {
+            let mut request_guard = ctx.request.lock().await;
+            request_guard
+                .iter_spks(keychain.clone())
+                .skip((new_active_index + 1) as usize)
+                .take(stop_gap)
+                .map(|(index, script)| {
+                    let script_hash = ElectrumScriptHash::new(&script);
+                    let subscription = ScriptSubscription::new(HashSet::new());
+                    (script_hash, subscription, index)
+                })
+                .collect()
+        };
+
+        if scripts_to_subscribe.is_empty() {
+            return Ok(());
+        }
+
+        // Collect script hashes for subscription
+        let script_hashes: Vec<ElectrumScriptHash> = scripts_to_subscribe
+            .iter()
+            .map(|(hash, _, _)| *hash)
+            .collect();
+
+        // Subscribe via Electrum first (this can fail)
+        self.inner
+            .batch_script_hash_subscribe(script_hashes.iter().copied())?;
+
+        // Only update state if subscription succeeded
+        // Update last_active_index
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert(keychain.clone(), new_active_index);
+        }
+
+        // Update tracker
+        {
+            let mut tracker = self.subscription_tracker.scripts.lock().await;
+            for (hash, subscription, _) in &scripts_to_subscribe {
+                tracker.insert(*hash, subscription.clone());
+            }
+        }
+
+        // Update the stream's subscribed scripts and lookup in a single batch
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+
+            scripts.extend(script_hashes);
+            for (hash, _, index) in &scripts_to_subscribe {
+                lookup.insert(*hash, (keychain.clone(), *index));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a script hash notification and return a TxUpdate if there are changes
+    async fn process_script_hash_update(
+        &self,
+        script_hash: ElectrumScriptHash,
+        start_time: u64,
+        fetch_prev_txouts: bool,
+    ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error> {
+        // Look up the script from our tracker
+        let tracker = self.subscription_tracker.scripts.lock().await;
+        let Some(subscription) = tracker.get(&script_hash).cloned() else {
+            // Not tracking this script, ignore
+            return Ok(None);
+        };
+        drop(tracker);
+
+        let expected_txids: HashSet<Txid> = subscription.expected_txids;
+
+        // Fetch current history for this script
+        let history = self.inner.script_get_history(script_hash).await?;
+        let current_txids: HashSet<Txid> = history.iter().map(|tx| tx.txid()).collect();
+
+        // Check if there are any changes
+        if current_txids == expected_txids {
+            return Ok(None);
+        }
+
+        // Build a TxUpdate with the changes
+        let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
+
+        // Mark evicted transactions
+        for evicted_txid in expected_txids.difference(&current_txids) {
+            tx_update.evicted_ats.insert((*evicted_txid, start_time));
+        }
+
+        // Fetch new transactions
+        for tx_res in history {
+            if !expected_txids.contains(&tx_res.txid()) {
+                let tx: Arc<Transaction> = self.fetch_tx(tx_res.txid()).await?;
+                tx_update.txs.push(tx);
+
+                match tx_res.electrum_height().try_into() {
+                    Ok(height) if height > 0 => {
+                        self.validate_merkle_for_anchor(&mut tx_update, tx_res.txid(), height)
+                            .await?;
+                    }
+                    _ => {
+                        tx_update.seen_ats.insert((tx_res.txid(), start_time));
+                    }
+                }
+            }
+        }
+
+        // Fetch previous `TxOut`s for fee calculation if flag is enabled.
+        if fetch_prev_txouts {
+            self.fetch_prev_txout(&mut tx_update).await?;
+        }
+
+        // Update our tracker with the new expected txids
+        let mut tracker = self.subscription_tracker.scripts.lock().await;
+        if let Some(subscription) = tracker.get_mut(&script_hash) {
+            subscription.expected_txids = current_txids;
+        }
+
+        Ok(Some(SyncResponse {
+            tx_update,
+            chain_update: None,
+        }))
+    }
+
     /// Populate the `tx_update` with transactions/anchors associated with the given `spks`.
     ///
     /// Transactions that contains an output with requested spk, or spends form an output with
     /// requested spk will be added to `tx_update`. Anchors of the aforementioned transactions are
     /// also included.
+    ///
+    /// If `subscribe` is true, also subscribes to scripts with history for real-time updates
+    /// and returns the set of subscribed script hashes.
     async fn populate_with_spks(
         &self,
         start_time: u64,
@@ -265,16 +644,18 @@ impl BdkElectrumClient {
         mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
         stop_gap: usize,
         batch_size: usize,
-    ) -> Result<Option<u32>, Error> {
+        subscribe: bool,
+    ) -> Result<(Option<u32>, HashSet<ElectrumScriptHash>), Error> {
         let mut unused_spk_count = 0_usize;
         let mut last_active_index = Option::<u32>::None;
+        let mut subscribed_hashes = HashSet::new();
 
         loop {
             let spks = (0..batch_size)
                 .map_while(|_| spks_with_expected_txids.next())
                 .collect::<Vec<_>>();
             if spks.is_empty() {
-                return Ok(last_active_index);
+                return Ok((last_active_index, subscribed_hashes));
             }
 
             let spk_histories = self
@@ -282,15 +663,33 @@ impl BdkElectrumClient {
                 .batch_script_get_history(spks.iter().map(|(_, s)| s.spk.as_script()))
                 .await?;
 
+            // Collect scripts to subscribe (if subscribe=true)
+            let mut scripts_to_subscribe: Vec<(ElectrumScriptHash, ScriptSubscription)> =
+                Vec::new();
+
             for ((spk_index, spk), spk_history) in spks.into_iter().zip(spk_histories) {
                 if spk_history.is_empty() {
                     unused_spk_count = unused_spk_count.saturating_add(1);
                     if unused_spk_count >= stop_gap {
-                        return Ok(last_active_index);
+                        // Subscribe to collected scripts before returning
+                        if subscribe && !scripts_to_subscribe.is_empty() {
+                            self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
+                                .await;
+                        }
+                        return Ok((last_active_index, subscribed_hashes));
                     }
                 } else {
                     last_active_index = Some(spk_index);
                     unused_spk_count = 0;
+
+                    // Collect for subscription if enabled
+                    if subscribe {
+                        let script_hash = ElectrumScriptHash::new(&spk.spk);
+                        let spk_history_set: HashSet<Txid> =
+                            spk_history.iter().map(|res| res.txid()).collect();
+                        let subscription = ScriptSubscription::new(spk_history_set.clone());
+                        scripts_to_subscribe.push((script_hash, subscription));
+                    }
                 }
 
                 let spk_history_set = spk_history
@@ -318,6 +717,12 @@ impl BdkElectrumClient {
                         }
                     }
                 }
+            }
+
+            // Subscribe to all scripts with history in this batch
+            if subscribe && !scripts_to_subscribe.is_empty() {
+                self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
+                    .await;
             }
         }
     }
@@ -442,8 +847,40 @@ impl BdkElectrumClient {
         Ok(())
     }
 
-    // Helper function which checks if a transaction is confirmed by validating the merkle proof.
-    // An anchor is inserted if the transaction is validated to be in a confirmed block.
+    /// Subscribe to a batch of scripts via Electrum and update the subscription tracker.
+    ///
+    /// This method updates the internal subscription tracker with the provided scripts,
+    /// adds their hashes to the provided set, and then subscribes to them via Electrum.
+    /// If the Electrum subscription fails, it logs an error but doesn't propagate it.
+    async fn subscribe_scripts(
+        &self,
+        scripts: &[(ElectrumScriptHash, ScriptSubscription)],
+        subscribed_hashes: &mut HashSet<ElectrumScriptHash>,
+    ) {
+        // Update subscription tracker
+        {
+            let mut tracker = self.subscription_tracker.scripts.lock().await;
+            for (hash, subscription) in scripts {
+                tracker.insert(*hash, subscription.clone());
+                subscribed_hashes.insert(*hash);
+            }
+        }
+
+        // Subscribe via Electrum
+        if let Err(e) = self
+            .inner
+            .batch_script_hash_subscribe(scripts.iter().map(|(hash, _)| *hash))
+        {
+            tracing::error!("Failed to subscribe scripts: {}", e);
+        }
+    }
+
+    /// Validate a transaction's merkle proof and add an anchor if confirmed.
+    ///
+    /// This method fetches the merkle proof for the transaction, validates it against
+    /// the block header's merkle root, and adds a confirmation anchor to the tx_update
+    /// if the transaction is confirmed. If the cached header is outdated, it will fetch
+    /// a fresh header and retry validation.
     async fn validate_merkle_for_anchor(
         &self,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
@@ -487,9 +924,12 @@ impl BdkElectrumClient {
         Ok(())
     }
 
-    // Helper function which fetches the `TxOut`s of our relevant transactions' previous
-    // transactions, which we do not have by default. This data is needed to calculate the
-    // transaction fee.
+    /// Fetch previous transaction outputs for fee calculation.
+    ///
+    /// This method fetches the `TxOut`s of the previous transactions for all inputs
+    /// of relevant transactions in the tx_update. This data is needed to calculate
+    /// transaction fees. Coinbase transactions are skipped, and duplicate fetches
+    /// are avoided using a deduplication set.
     async fn fetch_prev_txout(
         &self,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
@@ -573,7 +1013,7 @@ async fn fetch_tip_and_latest_blocks(
     let new_tip = new_blocks
         .iter()
         // Prune `new_blocks` to only include blocks that are actually new.
-        .filter(|(height, _)| Some(*<&u32>::clone(height)) > agreement_height)
+        .filter(|(height, _)| Some(**height) > agreement_height)
         .map(|(height, hash)| BlockId {
             height: *height,
             hash: *hash,
@@ -587,6 +1027,38 @@ async fn fetch_tip_and_latest_blocks(
         .expect("must have at least one checkpoint");
 
     Ok((new_tip, new_blocks))
+}
+
+/// Handle block header notification and update the chain tip
+async fn handle_block_header_notification<K>(
+    height: u32,
+    header: Header,
+    ctx: &SubscriptionCtx<K>,
+) -> Option<Result<SyncResponse<ConfirmationBlockTime>, Error>>
+where
+    K: Ord + Clone,
+{
+    let mut tip_guard = ctx.chain_tip.lock().await;
+
+    match tip_guard.take() {
+        Some(tip) => {
+            let block_id = BlockId {
+                hash: header.block_hash(),
+                height,
+            };
+            let new_tip = tip.insert(block_id);
+
+            // Store the updated tip
+            *tip_guard = Some(new_tip.clone());
+
+            // Emit chain_update only (no tx_update)
+            Some(Ok(SyncResponse {
+                tx_update: TxUpdate::default(),
+                chain_update: Some(new_tip),
+            }))
+        }
+        None => None,
+    }
 }
 
 // Add a corresponding checkpoint per anchor height if it does not yet exist. Checkpoints should not
@@ -610,4 +1082,34 @@ fn chain_update(
         }
     }
     Ok(tip)
+}
+
+/// Build a reverse lookup map: script_hash -> (keychain, index)
+///
+/// This allows us to efficiently determine which keychain a transaction belongs to
+fn build_reverse_lookup_map<K>(
+    request: &mut FullScanRequest<K>,
+    response: &FullScanResponse<K>,
+    stop_gap: usize,
+) -> HashMap<ElectrumScriptHash, (K, u32)>
+where
+    K: Ord + Clone,
+{
+    let mut script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)> = HashMap::new();
+
+    for keychain in request.keychains() {
+        for (index, script) in request.iter_spks(keychain.clone()) {
+            let script_hash = ElectrumScriptHash::new(script);
+            script_to_keychain_index.insert(script_hash, (keychain.clone(), index));
+
+            // Only iterate up to last_active_index + stop_gap to avoid billions of iterations
+            if let Some(&last_active) = response.last_active_indices.get(&keychain) {
+                if index > last_active + stop_gap as u32 {
+                    break;
+                }
+            }
+        }
+    }
+
+    script_to_keychain_index
 }
