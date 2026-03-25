@@ -10,7 +10,7 @@ use bdk_core::spk_client::{
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 pub use tokio_electrum::client::{ElectrumClient, Error};
 use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
@@ -90,7 +90,7 @@ pub struct BdkElectrumClient {
     /// The underlying electrum client.
     inner: ElectrumClient,
     /// The transaction cache
-    tx_cache: Arc<Mutex<HashMap<Txid, Arc<Transaction>>>>,
+    tx_cache: Arc<RwLock<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
     block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
     /// Subscription tracker for real-time sync
@@ -123,7 +123,7 @@ impl BdkElectrumClient {
         I: IntoIterator<Item = T>,
         T: Into<Arc<Transaction>>,
     {
-        let mut tx_cache = self.tx_cache.lock().await;
+        let mut tx_cache = self.tx_cache.write().await;
 
         for tx in txs.into_iter() {
             let tx: Arc<Transaction> = tx.into();
@@ -136,15 +136,18 @@ impl BdkElectrumClient {
     ///
     /// If it hits the cache it will return the cached version and avoid making the request.
     async fn fetch_tx(&self, txid: Txid) -> Result<Arc<Transaction>, Error> {
-        let mut tx_cache = self.tx_cache.lock().await;
+        {
+            let tx_cache = self.tx_cache.read().await;
 
-        if let Some(tx) = tx_cache.get(&txid) {
-            return Ok(Arc::clone(tx));
+            if let Some(tx) = tx_cache.get(&txid) {
+                return Ok(Arc::clone(tx));
+            }
         }
 
         let tx: Transaction = self.inner.transaction_get(txid).await?;
         let tx: Arc<Transaction> = Arc::new(tx);
 
+        let mut tx_cache = self.tx_cache.write().await;
         tx_cache.insert(txid, tx.clone());
 
         Ok(tx)
