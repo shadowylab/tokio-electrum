@@ -77,10 +77,11 @@ impl ElectrumConnectionStatus {
     //     matches!(self, Self::Initialized)
     // }
 
-    // #[inline]
-    // pub(crate) fn is_connected(&self) -> bool {
-    //     matches!(self, Self::Connected)
-    // }
+    /// Check if it's connected.
+    #[inline]
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected)
+    }
 
     /// Check if is `disconnected` or `terminated`.
     #[inline]
