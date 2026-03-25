@@ -10,11 +10,12 @@ use bdk_core::spk_client::{
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 pub use tokio_electrum::client::{ElectrumClient, Error};
 use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::util;
 
@@ -415,7 +416,20 @@ impl BdkElectrumClient {
             chain_tip: Mutex::new(response.chain_update.clone()),
         });
 
-        let stream = BroadcastStream::new(notification_rx).filter_map(move |result| {
+        // Create a oneshot channel
+        let (tx, rx_done) = oneshot::channel();
+        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
+
+        let stream = BroadcastStream::new(notification_rx).inspect(move |notification| {
+            if let Ok(ElectrumNotification::ConnectionStatusChanged(status)) = notification {
+                if status.is_disconnected() {
+                    // Take the sender and send the oneshot notification
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }).filter_map(move |result| {
             let client: BdkElectrumClient = client.clone();
             let ctx: Arc<SubscriptionCtx<K>> = ctx.clone();
 
@@ -435,18 +449,14 @@ impl BdkElectrumClient {
                     Ok(ElectrumNotification::BlockHeader { height, header }) => {
                         handle_block_header_notification(height, header, &ctx).await
                     }
-                    Ok(ElectrumNotification::Shutdown) => {
-                        tracing::warn!("Electrum connection shutdown notification received");
-                        None
-                    }
                     Ok(_) => None,  // Ignore other notifications
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    Err(BroadcastStreamRecvError::Lagged(n)) => {
                         tracing::warn!("Subscription stream lagged behind by {} messages - some updates may have been missed", n);
                         None
                     }
                 }
             }
-        });
+        }).take_until(rx_done);
 
         Box::pin(stream)
     }

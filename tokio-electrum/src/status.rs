@@ -84,7 +84,7 @@ impl ElectrumConnectionStatus {
 
     /// Check if is `disconnected` or `terminated`.
     #[inline]
-    pub(crate) fn is_disconnected(&self) -> bool {
+    pub fn is_disconnected(&self) -> bool {
         matches!(self, Self::Disconnected | Self::Terminated)
     }
 
