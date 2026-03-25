@@ -508,6 +508,8 @@ impl InnerClient {
             let notification: Option<ElectrumNotification> = match event {
                 Event::Response(res) => match res {
                     SatisfiedRequest::HeadersSubscribe { resp, .. } => {
+                        tracing::debug!(addr = %self.addr, "Subscribed to headers.");
+
                         // Mark as subscribed
                         self.tracker.set_headers_subscribed(true);
 
@@ -788,6 +790,9 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     pub async fn get_tip(&self) -> Result<BlockHeader, Error> {
+        // Explicitly mark as subscribed, also if we mark it again in receiver_message_handler
+        self.inner.tracker.set_headers_subscribed(true);
+
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(HeadersSubscribe);
 
@@ -802,6 +807,9 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     pub fn block_headers_subscribe(&self) -> Result<(), Error> {
+        // Explicitly mark as subscribed, also if we mark it again in receiver_message_handler
+        self.inner.tracker.set_headers_subscribed(true);
+
         let mut batch = AsyncBatchRequest::new();
         batch.event_request(HeadersSubscribe);
         self.inner.send_batch(batch)?;
