@@ -399,8 +399,14 @@ impl InnerClient {
             let mut batch = AsyncBatchRequest::new();
             batch.event_request(HeadersSubscribe);
 
-            if let Err(e) = client.send_batch(batch) {
-                tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.");
+            match client.send_batch(batch) {
+                Ok(true) => {
+                    tracing::debug!(addr = %self.addr, "Successfully resubscribed to headers.")
+                }
+                Ok(false) => tracing::warn!(addr = %self.addr, "Headers subscription failed."),
+                Err(e) => {
+                    tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.")
+                }
             }
         }
 
@@ -410,7 +416,7 @@ impl InnerClient {
 
             // If are cached any script hashes, resubscribe.
             if !script_hashes.is_empty() {
-                tracing::debug!(addr = %self.addr, "Resubscribing to script hashes.");
+                tracing::debug!(addr = %self.addr, "Resubscribing to {} script hashes.", script_hashes.len());
 
                 let mut batch = AsyncBatchRequest::new();
 
@@ -420,8 +426,16 @@ impl InnerClient {
 
                 drop(script_hashes);
 
-                if let Err(e) = self.send_batch(batch) {
-                    tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.");
+                match client.send_batch(batch) {
+                    Ok(true) => {
+                        tracing::debug!(addr = %self.addr, "Successfully resubscribed to script hashes.")
+                    }
+                    Ok(false) => {
+                        tracing::warn!(addr = %self.addr, "Script hashes subscription failed.")
+                    }
+                    Err(e) => {
+                        tracing::error!(addr = %self.addr, error = %e, "Error during script hashes resubscribe.")
+                    }
                 }
             }
         }
@@ -469,6 +483,8 @@ impl InnerClient {
             tokio::select! {
                 // Batch request receiver
                 Some(batch_request) = rx_batch_request.recv() => {
+                    tracing::trace!("Sending batch request: {:?}", batch_request);
+
                     client.send_batch(batch_request)?;
                 }
                 // Ping channel receiver
