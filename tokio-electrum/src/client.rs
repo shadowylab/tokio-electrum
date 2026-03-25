@@ -490,7 +490,7 @@ impl InnerClient {
                 // Ping channel receiver
                 _ = self.channels.ping.notified() => {
                     tracing::trace!(addr = %self.addr, "Sending ping.");
-                    send_request_with_timeout(client, Duration::from_secs(10), Ping).await?;
+                    send_request_with_timeout(client, Duration::from_secs(5), Ping).await?;
                     tracing::trace!(addr = %self.addr, "Ping sent.");
                 }
                 else => break
