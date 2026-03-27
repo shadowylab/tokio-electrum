@@ -30,6 +30,7 @@ jobs:
       matrix:
         args:
           - tokio-electrum
+          - bdk-tokio-electrum
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,4 +45,4 @@ jobs:
         run: cargo clippy -p ${{ matrix.args }} -- -D warnings
 
       - name: Test
-        run: cargo test -p ${{ matrix.args }}
+        run: cargo test -p ${{ matrix.args }} -- --test-threads=1

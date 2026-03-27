@@ -957,3 +957,833 @@ where
 
     script_to_keychain_index
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bdk_core::bitcoin::absolute::LockTime;
+    use bdk_core::bitcoin::constants::genesis_block;
+    use bdk_core::bitcoin::transaction::Version;
+    use bdk_core::bitcoin::{
+        Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+    use bdk_core::spk_client::FullScanRequest;
+    use bdk_core::{BlockId, CheckPoint};
+    use futures::StreamExt;
+    use testenv::TestEnv;
+    use tokio::time::{sleep, timeout};
+    use tokio_electrum::address::ElectrumServerAddress;
+    use tokio_electrum::client::ElectrumClient;
+
+    use super::*;
+
+    fn hash(hex: &str) -> BlockHash {
+        BlockHash::from_str(hex).unwrap()
+    }
+
+    fn txid(hex: &str) -> Txid {
+        Txid::from_str(hex).unwrap()
+    }
+
+    fn script(byte: u8) -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![byte])
+    }
+
+    fn dummy_tx(tag: u8) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000 + tag as u64),
+                script_pubkey: script(tag),
+            }],
+        }
+    }
+
+    fn test_bdk_client() -> BdkElectrumClient {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        BdkElectrumClient::new(ElectrumClient::new(addr))
+    }
+
+    fn ctx_for_request(request: FullScanRequest<String>) -> SubscriptionCtx<String> {
+        SubscriptionCtx {
+            request: Mutex::new(request),
+            subscribed_scripts: Mutex::new(HashSet::new()),
+            script_to_keychain_index: Mutex::new(HashMap::new()),
+            last_active_indices: Mutex::new(BTreeMap::new()),
+            chain_tip: Mutex::new(None),
+        }
+    }
+
+    async fn wait_connected(client: &ElectrumClient) {
+        let connected = timeout(Duration::from_secs(20), async {
+            loop {
+                if client.status().is_connected() {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            connected.is_ok(),
+            "timed out waiting for electrum connection"
+        );
+    }
+
+    #[test]
+    fn chain_update_inserts_missing_anchor_checkpoint_from_latest_blocks() {
+        let tip = CheckPoint::new(BlockId {
+            height: 0,
+            hash: hash("0000000000000000000000000000000000000000000000000000000000000000"),
+        })
+        .insert(BlockId {
+            height: 5,
+            hash: hash("0000000000000000000000000000000000000000000000000000000000000005"),
+        });
+        let latest_blocks = BTreeMap::from([(
+            4_u32,
+            hash("0000000000000000000000000000000000000000000000000000000000000004"),
+        )]);
+        let anchors = vec![
+            (
+                ConfirmationBlockTime {
+                    confirmation_time: 0,
+                    block_id: BlockId {
+                        height: 4,
+                        hash: hash(
+                            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                        ),
+                    },
+                },
+                txid("0101010101010101010101010101010101010101010101010101010101010101"),
+            ),
+            (
+                ConfirmationBlockTime {
+                    confirmation_time: 0,
+                    block_id: BlockId {
+                        height: 6,
+                        hash: hash(
+                            "abababababababababababababababababababababababababababababababab",
+                        ),
+                    },
+                },
+                txid("0202020202020202020202020202020202020202020202020202020202020202"),
+            ),
+        ];
+
+        let updated = chain_update(tip, &latest_blocks, anchors.into_iter()).unwrap();
+        let cp4 = updated
+            .get(4)
+            .expect("checkpoint at anchor height should be inserted");
+        assert_eq!(cp4.block_id().hash, latest_blocks[&4]);
+        assert!(
+            updated.get(6).is_none(),
+            "height beyond tip must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_block_header_notification_returns_none_without_tip() {
+        let request = FullScanRequest::<String>::builder_at(0).build();
+        let ctx = SubscriptionCtx {
+            request: Mutex::new(request),
+            subscribed_scripts: Mutex::new(HashSet::new()),
+            script_to_keychain_index: Mutex::new(HashMap::new()),
+            last_active_indices: Mutex::new(BTreeMap::new()),
+            chain_tip: Mutex::new(None),
+        };
+        let header = genesis_block(Network::Regtest).header;
+
+        let update = handle_block_header_notification(1, header, &ctx).await;
+        assert!(update.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_block_header_notification_updates_chain_tip() {
+        let genesis = genesis_block(Network::Regtest);
+        let request = FullScanRequest::<String>::builder_at(0).build();
+        let ctx = SubscriptionCtx {
+            request: Mutex::new(request),
+            subscribed_scripts: Mutex::new(HashSet::new()),
+            script_to_keychain_index: Mutex::new(HashMap::new()),
+            last_active_indices: Mutex::new(BTreeMap::new()),
+            chain_tip: Mutex::new(Some(CheckPoint::new(BlockId {
+                height: 0,
+                hash: genesis.block_hash(),
+            }))),
+        };
+
+        let update = handle_block_header_notification(1, genesis.header, &ctx)
+            .await
+            .expect("expected update")
+            .unwrap();
+        let new_tip = update.chain_update.expect("missing chain update");
+        assert_eq!(new_tip.height(), 1);
+    }
+
+    #[test]
+    fn build_reverse_lookup_map_respects_last_active_plus_stop_gap() {
+        let mut request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x51)),
+                    (1, script(0x52)),
+                    (2, script(0x53)),
+                    (3, script(0x54)),
+                    (4, script(0x55)),
+                ],
+            )
+            .build();
+        let response = FullScanResponse {
+            tx_update: TxUpdate::default(),
+            chain_update: None,
+            last_active_indices: BTreeMap::from([("external".to_string(), 1)]),
+        };
+
+        let lookup = build_reverse_lookup_map(&mut request, &response, 1);
+        let max_index = lookup.values().map(|(_, index)| *index).max().unwrap();
+        assert_eq!(max_index, 3);
+        assert!(
+            !lookup.values().any(|(_, index)| *index == 4),
+            "lookup should stop after the first index greater than last_active + stop_gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn populate_tx_cache_and_fetch_tx_cache_hit() {
+        let client = test_bdk_client();
+        let tx = Arc::new(dummy_tx(0x77));
+        let txid = tx.compute_txid();
+
+        client.populate_tx_cache(vec![tx.clone()]).await;
+        let fetched = client.fetch_tx(txid).await.unwrap();
+
+        assert_eq!(fetched.compute_txid(), txid);
+        assert!(Arc::ptr_eq(&fetched, &tx));
+    }
+
+    #[tokio::test]
+    async fn fetch_header_uses_cache_when_present() {
+        let client = test_bdk_client();
+        let header = genesis_block(Network::Regtest).header;
+
+        {
+            let mut cache = client.block_header_cache.lock().await;
+            cache.insert(42, header);
+        }
+
+        let fetched = client.fetch_header(42).await.unwrap();
+        assert_eq!(fetched, header);
+    }
+
+    #[tokio::test]
+    async fn subscription_ctx_lookup_and_extension_logic() {
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x11)),
+                    (1, script(0x12)),
+                    (2, script(0x13)),
+                    (3, script(0x14)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+
+        let hash1 = ElectrumScriptHash::new(&script(0x12));
+        let hash3 = ElectrumScriptHash::new(&script(0x14));
+
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            scripts.insert(hash1);
+            scripts.insert(hash3);
+        }
+        {
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+            lookup.insert(hash1, ("external".to_string(), 1));
+            lookup.insert(hash3, ("external".to_string(), 3));
+        }
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert("external".to_string(), 1);
+        }
+
+        assert!(ctx.has_script(&hash1).await);
+        assert_eq!(
+            ctx.keychain_index(&hash1).await,
+            Some(("external".to_string(), 1))
+        );
+        assert_eq!(ctx.needs_extension(&hash1).await, None);
+        assert_eq!(
+            ctx.needs_extension(&hash3).await,
+            Some(("external".to_string(), 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_incremental_updates_state() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x21)),
+                    (1, script(0x22)),
+                    (2, script(0x23)),
+                    (3, script(0x24)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+
+        client
+            .subscribe_incremental("external".to_string(), 0, 2, &ctx)
+            .await
+            .unwrap();
+
+        let expected_hashes = vec![
+            ElectrumScriptHash::new(&script(0x22)),
+            ElectrumScriptHash::new(&script(0x23)),
+        ];
+        let scripts = ctx.subscribed_scripts.lock().await;
+        for hash in &expected_hashes {
+            assert!(scripts.contains(hash));
+        }
+        drop(scripts);
+
+        let lookup = ctx.script_to_keychain_index.lock().await;
+        assert_eq!(
+            lookup.get(&expected_hashes[0]),
+            Some(&("external".to_string(), 1))
+        );
+        assert_eq!(
+            lookup.get(&expected_hashes[1]),
+            Some(&("external".to_string(), 2))
+        );
+        drop(lookup);
+
+        let last_active = ctx.last_active_indices.lock().await;
+        assert_eq!(last_active.get("external"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn subscribe_incremental_noop_when_no_more_scripts() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, script(0x31)), (1, script(0x32))],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+
+        client
+            .subscribe_incremental("external".to_string(), 10, 3, &ctx)
+            .await
+            .unwrap();
+
+        assert!(ctx.subscribed_scripts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_script_hash_notification_ignores_unsubscribed_hash() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0).build();
+        let ctx = ctx_for_request(request);
+        let hash = ElectrumScriptHash::new(&script(0x41));
+
+        let update = client
+            .handle_script_hash_notification(hash, 0, false, 2, &ctx)
+            .await;
+        assert!(update.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_script_hash_notification_can_extend_without_update() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x51)),
+                    (1, script(0x52)),
+                    (2, script(0x53)),
+                    (3, script(0x54)),
+                    (4, script(0x55)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+        let trigger_hash = ElectrumScriptHash::new(&script(0x53));
+
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            scripts.insert(trigger_hash);
+        }
+        {
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+            lookup.insert(trigger_hash, ("external".to_string(), 2));
+        }
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert("external".to_string(), 1);
+        }
+
+        let update = client
+            .handle_script_hash_notification(trigger_hash, 0, false, 2, &ctx)
+            .await;
+        assert!(
+            update.is_none(),
+            "no tx tracker entry should yield no update"
+        );
+
+        let last_active = ctx.last_active_indices.lock().await;
+        assert_eq!(last_active.get("external"), Some(&2));
+        drop(last_active);
+
+        let scripts = ctx.subscribed_scripts.lock().await;
+        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x54))));
+        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x55))));
+    }
+
+    #[tokio::test]
+    async fn process_script_hash_update_ignores_untracked_hash() {
+        let client = test_bdk_client();
+        let hash = ElectrumScriptHash::new(&script(0x61));
+
+        let update = client
+            .process_script_hash_update(hash, 0, false)
+            .await
+            .unwrap();
+        assert!(update.is_none());
+    }
+
+    #[test]
+    fn chain_update_uses_anchor_hash_when_latest_block_is_missing() {
+        let tip = CheckPoint::new(BlockId {
+            height: 0,
+            hash: hash("0000000000000000000000000000000000000000000000000000000000000000"),
+        })
+        .insert(BlockId {
+            height: 5,
+            hash: hash("0000000000000000000000000000000000000000000000000000000000000005"),
+        });
+        let anchor_hash = hash("1111111111111111111111111111111111111111111111111111111111111111");
+        let anchors = vec![(
+            ConfirmationBlockTime {
+                confirmation_time: 123,
+                block_id: BlockId {
+                    height: 4,
+                    hash: anchor_hash,
+                },
+            },
+            txid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )];
+
+        let updated = chain_update(tip, &BTreeMap::new(), anchors.into_iter()).unwrap();
+        assert_eq!(updated.get(4).unwrap().block_id().hash, anchor_hash);
+    }
+
+    #[tokio::test]
+    async fn fetch_tip_and_latest_blocks_returns_prev_tip_if_server_tip_is_lower() {
+        let env = TestEnv::new();
+        let addr =
+            ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
+        let client = ElectrumClient::new(addr);
+        client.connect();
+        wait_connected(&client).await;
+
+        let prev_tip = CheckPoint::new(BlockId {
+            height: 1_000,
+            hash: hash("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        });
+        let (tip, latest) = fetch_tip_and_latest_blocks(&client, prev_tip.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(tip, prev_tip);
+        assert!(latest.is_empty());
+        client.disconnect();
+    }
+
+    #[tokio::test]
+    async fn fetch_tip_and_latest_blocks_handles_disagreeing_prev_tip() {
+        let env = TestEnv::new();
+        let mine_to = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(3, &mine_to)
+            .unwrap();
+        let indexed_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(indexed_height);
+
+        let addr =
+            ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
+        let client = ElectrumClient::new(addr);
+        client.connect();
+        wait_connected(&client).await;
+
+        let wrong_prev_tip = CheckPoint::new(BlockId {
+            height: 0,
+            hash: hash("abababababababababababababababababababababababababababababababab"),
+        });
+
+        let (tip, latest) = fetch_tip_and_latest_blocks(&client, wrong_prev_tip)
+            .await
+            .unwrap();
+
+        assert!(tip.height() > 0, "expected reconstructed tip from electrum");
+        assert!(
+            !latest.is_empty(),
+            "expected latest block map to be populated"
+        );
+        client.disconnect();
+    }
+
+    async fn connected_bdk_client(env: &TestEnv) -> BdkElectrumClient {
+        let addr =
+            ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
+        let inner = ElectrumClient::new(addr);
+        let client = BdkElectrumClient::new(inner);
+        client.connect();
+        wait_connected(&client).await;
+        client
+    }
+
+    fn current_tip_checkpoint(env: &TestEnv) -> CheckPoint {
+        let height: u32 = env
+            .bitcoind
+            .client
+            .get_blockchain_info()
+            .unwrap()
+            .blocks
+            .try_into()
+            .unwrap();
+        let hash = env
+            .bitcoind
+            .client
+            .get_block_hash(height as u64)
+            .unwrap()
+            .block_hash()
+            .unwrap();
+        CheckPoint::new(BlockId { height, hash })
+    }
+
+    fn ensure_funded_wallet(env: &TestEnv) {
+        let reward_addr = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(101, &reward_addr)
+            .unwrap();
+        let tip_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(tip_height);
+    }
+
+    #[tokio::test]
+    async fn sync_stream_initial_empty_for_unused_spk() {
+        let env = TestEnv::new();
+        let client = connected_bdk_client(&env).await;
+
+        let unused_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, unused_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+        match first {
+            SubscribeEvent::Initial(initial) => assert!(initial.is_empty()),
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_stream_initial_contains_chain_update_when_chain_tip_present() {
+        let env = TestEnv::new();
+        let client = connected_bdk_client(&env).await;
+
+        let unused_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, unused_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+        match first {
+            SubscribeEvent::Initial(initial) => {
+                assert!(initial.chain_update.is_some(), "expected chain update");
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_stream_initial_populates_prev_txouts_when_requested() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(50_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request, 20, 20, true).await.unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        match first {
+            SubscribeEvent::Initial(initial) => {
+                assert!(
+                    !initial.tx_update.txs.is_empty(),
+                    "expected transaction data"
+                );
+                assert!(
+                    !initial.tx_update.txouts.is_empty(),
+                    "expected previous txouts to be fetched"
+                );
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_stream_emits_update_after_new_block() {
+        let env = TestEnv::new();
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let new_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(new_height);
+
+        let saw_chain_update = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update)) if update.chain_update.is_some() => {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(saw_chain_update, "expected chain update after new block");
+    }
+
+    #[tokio::test]
+    async fn sync_stream_emits_disconnected_event_on_disconnect() {
+        let env = TestEnv::new();
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(1, &tracked_address)
+            .unwrap();
+        let indexed_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(indexed_height);
+
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+
+        let _ = timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("stream timed out waiting for initial event")
+            .expect("stream terminated before initial event")
+            .expect("initial event should not be an error");
+
+        client.disconnect();
+
+        let disconnected = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event, Ok(SubscribeEvent::Disconnected)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(disconnected, "expected disconnected event after disconnect");
+    }
+
+    #[tokio::test]
+    async fn sync_stream_ignores_untracked_script_notifications() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let other_address = env.bitcoind.client.new_address().unwrap();
+        let other_hash = ElectrumScriptHash::new(&other_address.script_pubkey());
+
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        // Subscribe directly on the underlying client to force unrelated script notifications.
+        client.script_hash_subscribe(other_hash).unwrap();
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&other_address, Amount::from_sat(12_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let maybe_event = timeout(Duration::from_secs(3), stream.next()).await;
+        assert!(
+            maybe_event.is_err(),
+            "did not expect bdk stream event for unrelated script hash notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_emits_script_tx_updates_for_tracked_hash() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let initial_txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(20_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&initial_txid);
+
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request, 20, 20, true).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let next_txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(21_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&next_txid);
+
+        let saw_tx_update = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == next_txid) =>
+                    {
+                        return !update.tx_update.txouts.is_empty();
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_tx_update,
+            "expected script-hash update with transaction and prevouts"
+        );
+    }
+}

@@ -15,9 +15,10 @@ bdk_core = "0.6"
 futures = "0.3"
 tokio = { workspace = true, features = ["sync"] }
 tokio-electrum = { path = "../tokio-electrum", version = "0.1" }
-tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
 bdk_wallet = "2.3"
+testenv.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

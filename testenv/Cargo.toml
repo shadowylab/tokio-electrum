@@ -1,0 +1,8 @@
+[package]
+name = "testenv"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+electrsd = { version = "0.36", features = ["corepc-node_25_2", "electrs_0_10_6"] }

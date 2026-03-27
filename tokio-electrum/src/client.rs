@@ -1130,11 +1130,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "socks")]
+    use std::net::SocketAddr;
+
+    use bitcoin::Amount;
+    use testenv::TestEnv;
+    use tokio::time::{sleep, timeout};
+
     use super::*;
+    use crate::builder::ElectrumConnectionMode;
 
     fn test_client() -> ElectrumClient {
         let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
         ElectrumClient::new(addr)
+    }
+
+    fn test_client_with_request_timeout(request_timeout: Duration) -> ElectrumClient {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        ElectrumClient::builder(addr)
+            .request_timeout(request_timeout)
+            .build()
     }
 
     #[tokio::test]
@@ -1174,5 +1189,416 @@ mod tests {
 
         assert_eq!(inner.status(), ElectrumConnectionStatus::Terminated);
         assert!(!inner.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_wait_batch_response_timeout() {
+        let client = test_client_with_request_timeout(Duration::from_millis(10));
+        let result = client
+            .wait_batch_response(async {
+                time::sleep(Duration::from_millis(100)).await;
+                42_u8
+            })
+            .await;
+        assert!(matches!(result, Err(Error::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_wait_batch_response_disconnected() {
+        let client = test_client_with_request_timeout(Duration::from_secs(5));
+        let inner = client.inner.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(20)).await;
+            inner.channels.disconnected();
+        });
+
+        let result = client.wait_batch_response(future::pending::<()>()).await;
+        assert!(matches!(result, Err(Error::Disconnected)));
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_disconnect_guards() {
+        let client = test_client();
+        client.disconnect();
+        assert!(client.status().is_terminated());
+
+        // No-op when already terminated.
+        client.disconnect();
+        assert!(client.status().is_terminated());
+
+        // No-op when status cannot connect.
+        client
+            .inner
+            .set_status(ElectrumConnectionStatus::Pending, false);
+        client.connect();
+        assert_eq!(client.status(), ElectrumConnectionStatus::Pending);
+    }
+
+    #[test]
+    fn test_spawn_connection_task_returns_if_running() {
+        let client = test_client();
+        client.inner.running.store(true, Ordering::SeqCst);
+        client.spawn_connection_task();
+        assert!(client.inner.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_send_batch_returns_network_mismatch() {
+        let client = test_client();
+        client.inner.tracker.set_network_mismatch(true);
+
+        let err = client.block_headers_subscribe().expect_err("must fail");
+        assert!(matches!(err, Error::NetworkMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_connect_helpers_error_paths() {
+        let tcp_addr = ElectrumServerAddress::parse("tcp://127.0.0.1:1").unwrap();
+        let ssl_addr = ElectrumServerAddress::parse("ssl://127.0.0.1:1").unwrap();
+
+        assert!(
+            connect_tcp(tcp_addr.addr(), ElectrumConnectionMode::Direct)
+                .await
+                .is_err()
+        );
+        assert!(
+            connect_ssl(ssl_addr.addr(), ElectrumConnectionMode::Direct)
+                .await
+                .is_err()
+        );
+        assert!(
+            connect(
+                &tcp_addr,
+                ElectrumConnectionMode::Direct,
+                Duration::from_millis(10),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            connect(
+                &ssl_addr,
+                ElectrumConnectionMode::Direct,
+                Duration::from_millis(10),
+            )
+            .await
+            .is_err()
+        );
+
+        #[cfg(feature = "socks")]
+        {
+            let proxy: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+            assert!(
+                connect_tcp(tcp_addr.addr(), ElectrumConnectionMode::Proxy(proxy))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                connect_ssl(ssl_addr.addr(), ElectrumConnectionMode::Proxy(proxy))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    async fn wait_connected(client: &ElectrumClient) {
+        let connected = timeout(Duration::from_secs(20), async {
+            loop {
+                if client.status().is_connected() {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            connected.is_ok(),
+            "timed out waiting for electrum connection"
+        );
+    }
+
+    async fn connected_regtest_client(env: &TestEnv) -> ElectrumClient {
+        let addr =
+            ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
+        let client = ElectrumClient::new(addr);
+        client.connect();
+        wait_connected(&client).await;
+        client
+    }
+
+    fn ensure_funded_wallet(env: &TestEnv) {
+        let reward_addr = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(101, &reward_addr)
+            .unwrap();
+        let tip_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(tip_height);
+    }
+
+    #[tokio::test]
+    async fn get_tip_and_history_from_regtest() {
+        let env = TestEnv::new();
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(1, &tracked_address)
+            .unwrap();
+
+        let target_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(target_height);
+
+        let client = connected_regtest_client(&env).await;
+
+        let tip = client.get_tip().await.unwrap();
+        assert!(
+            (tip.height as usize) >= target_height,
+            "tip {} should be >= {}",
+            tip.height,
+            target_height
+        );
+
+        let script_hash = ElectrumScriptHash::new(&tracked_address.script_pubkey());
+        let history = client.script_get_history(script_hash).await.unwrap();
+        assert!(
+            !history.is_empty(),
+            "expected non-empty history for tracked spk"
+        );
+    }
+
+    #[tokio::test]
+    async fn receives_block_header_notifications() {
+        let env = TestEnv::new();
+        let client = connected_regtest_client(&env).await;
+
+        let mut notifications = client.notifications();
+        let tip = client.get_tip().await.unwrap();
+        let expected_height = tip.height + 1;
+
+        let mine_to = env.bitcoind.client.new_address().unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(1, &mine_to)
+            .unwrap();
+        env.electrsd.wait_height(expected_height as usize);
+
+        let saw_header = timeout(Duration::from_secs(15), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(ElectrumNotification::BlockHeader { height, .. })
+                        if height >= expected_height =>
+                    {
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_header,
+            "did not receive expected block header notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_emits_shutdown_notification() {
+        let env = TestEnv::new();
+        let client = connected_regtest_client(&env).await;
+        let mut notifications = client.notifications();
+
+        client.disconnect();
+
+        let got_shutdown = timeout(Duration::from_secs(10), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(ElectrumNotification::Shutdown) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            got_shutdown,
+            "expected shutdown notification after disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_subscribe_and_unsubscribe_flow() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_regtest_client(&env).await;
+        let mut notifications = client.notifications();
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let tracked_hash = ElectrumScriptHash::new(&tracked_address.script_pubkey());
+
+        client.script_hash_subscribe(tracked_hash).unwrap();
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(25_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_subscribed_update = timeout(Duration::from_secs(15), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_subscribed_update,
+            "expected script notification while subscribed"
+        );
+
+        client.script_hash_unsubscribe(tracked_hash).unwrap();
+        client.script_hash_subscribe(tracked_hash).unwrap();
+
+        // Drain queue to avoid matching stale events from the previous tx.
+        while notifications.try_recv().is_ok() {}
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(26_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_resubscribed_update = timeout(Duration::from_secs(15), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_resubscribed_update,
+            "expected script notification after re-subscribing"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_roundtrip_for_batch_history_tx_and_merkle() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_regtest_client(&env).await;
+
+        let addr_a = env.bitcoind.client.new_address().unwrap();
+        let addr_b = env.bitcoind.client.new_address().unwrap();
+
+        let txid_a = env
+            .bitcoind
+            .client
+            .send_to_address(&addr_a, Amount::from_sat(40_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        let _txid_b = env
+            .bitcoind
+            .client
+            .send_to_address(&addr_b, Amount::from_sat(41_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+
+        env.electrsd.wait_tx(&txid_a);
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let tip_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(tip_height);
+        wait_connected(&client).await;
+
+        let tip = client.get_tip().await.unwrap();
+        let tip_header = client.block_header(tip.height).await.unwrap();
+        assert_eq!(tip_header.block_hash(), tip.header.block_hash());
+
+        let headers = client
+            .block_headers(tip.height.saturating_sub(1), 2)
+            .await
+            .unwrap();
+        assert!(!headers.headers.is_empty(), "expected headers response");
+
+        client.block_headers_subscribe().unwrap();
+
+        let hash_a = ElectrumScriptHash::new(&addr_a.script_pubkey());
+        let hash_b = ElectrumScriptHash::new(&addr_b.script_pubkey());
+
+        let single_history = client.script_get_history(hash_a).await.unwrap();
+        assert!(
+            !single_history.is_empty(),
+            "expected history for first script"
+        );
+
+        let batch_history = client
+            .batch_script_get_history([hash_a, hash_b])
+            .await
+            .unwrap();
+        assert_eq!(batch_history.len(), 2);
+        assert!(
+            batch_history.iter().all(|h| !h.is_empty()),
+            "expected both batch histories to be non-empty"
+        );
+
+        let tx = client.transaction_get(txid_a).await.unwrap();
+        assert_eq!(tx.compute_txid(), txid_a);
+
+        let confirmed = single_history
+            .into_iter()
+            .find(|entry| entry.electrum_height() > 0)
+            .expect("expected a confirmed entry");
+        let confirmation_height: u32 = confirmed.electrum_height().try_into().unwrap();
+
+        let merkle = client
+            .transaction_get_merkle(confirmed.txid(), confirmation_height)
+            .await
+            .unwrap();
+        assert_eq!(merkle.block_height.to_consensus_u32(), confirmation_height);
+
+        let _ = client.estimate_fee(2).await.unwrap();
+        let fee_estimates = client.batch_estimate_fee([1_usize, 2, 6]).await.unwrap();
+        assert!(fee_estimates.keys().all(|k| [1_usize, 2, 6].contains(k)));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_without_connection() {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        let client = ElectrumClient::builder(addr)
+            .request_timeout(Duration::from_millis(50))
+            .build();
+
+        let err = client.server_features().await.expect_err("must timeout");
+        assert!(matches!(err, Error::Timeout));
     }
 }

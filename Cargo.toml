@@ -1,9 +1,10 @@
 [workspace]
 members = [
     "bdk-tokio-electrum",
+    "testenv",
     "tokio-electrum",
 ]
-default-members = ["tokio-electrum"]
+default-members = ["tokio-electrum", "bdk-tokio-electrum"]
 resolver = "2"
 
 [workspace.package]
@@ -14,5 +15,6 @@ license = "MIT"
 rust-version = "1.85.0"
 
 [workspace.dependencies]
+testenv = { path = "testenv" }
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
