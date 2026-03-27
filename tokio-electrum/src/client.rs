@@ -42,7 +42,9 @@ use crate::constant::PING_INTERVAL;
 use crate::notification::ElectrumNotification;
 #[cfg(feature = "socks")]
 use crate::socks::TcpSocks5Stream;
-use crate::status::{AtomicElectrumConnectionStatus, ElectrumConnectionStatus};
+use crate::status::{
+    AtomicElectrumConnectionStatus, ElectrumConnectionStatus, InternalElectrumConnectionStatus,
+};
 use crate::types::{BlockHeader, BlockHeaders, ElectrumScriptHash, TransactionMerkel};
 
 type BoxReadStream = Box<dyn AsyncRead + Send + Unpin>;
@@ -204,40 +206,40 @@ impl InnerClient {
     }
 
     #[inline]
-    fn status(&self) -> ElectrumConnectionStatus {
+    fn status(&self) -> InternalElectrumConnectionStatus {
         self.status.load()
     }
 
-    fn set_status(&self, status: ElectrumConnectionStatus, log: bool) {
+    fn set_status(&self, status: InternalElectrumConnectionStatus, log: bool) {
         // Change status
         self.status.set(status);
 
         // Log
         if log {
             match status {
-                ElectrumConnectionStatus::Initialized => {
+                InternalElectrumConnectionStatus::Initialized => {
                     tracing::trace!(addr = %self.addr, "Electrum client initialized.")
                 }
-                ElectrumConnectionStatus::Pending => {
+                InternalElectrumConnectionStatus::Pending => {
                     tracing::trace!(addr = %self.addr, "Electrum client is pending.")
                 }
-                ElectrumConnectionStatus::Connecting => {
+                InternalElectrumConnectionStatus::Connecting => {
                     tracing::debug!("Connecting to '{}'", self.addr)
                 }
-                ElectrumConnectionStatus::Connected => {
+                InternalElectrumConnectionStatus::Connected => {
                     tracing::info!("Connected to '{}'", self.addr)
                 }
-                ElectrumConnectionStatus::Disconnected => {
+                InternalElectrumConnectionStatus::Disconnected => {
                     tracing::info!("Disconnected from '{}'", self.addr)
                 }
-                ElectrumConnectionStatus::Terminated => {
+                InternalElectrumConnectionStatus::Terminated => {
                     tracing::info!("Completely disconnected from '{}'", self.addr)
                 }
             }
         }
 
         // Send notification
-        self.send_notification(ElectrumNotification::ConnectionStatusChanged(status));
+        self.send_notification(ElectrumNotification::ConnectionStatusChanged(status.into()));
     }
 
     async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
@@ -255,7 +257,7 @@ impl InnerClient {
                 self.tracker.set_network_mismatch(true);
 
                 // Mark as terminated
-                self.set_status(ElectrumConnectionStatus::Terminated, true);
+                self.set_status(InternalElectrumConnectionStatus::Terminated, true);
 
                 // Return error
                 return Err(Error::NetworkMismatch);
@@ -297,7 +299,7 @@ impl InnerClient {
             self.connect_and_run(&mut rx_batch_requests).await;
 
             // Get status
-            let status: ElectrumConnectionStatus = self.status();
+            let status: InternalElectrumConnectionStatus = self.status();
 
             // If the connection is terminated, break the loop.
             if status.is_terminated() {
@@ -306,8 +308,8 @@ impl InnerClient {
 
             // Check if the client is marked as disconnected. If not, update status.
             // Check if disconnected to avoid a possible double log
-            if !status.is_disconnected() {
-                self.set_status(ElectrumConnectionStatus::Disconnected, true);
+            if !status.is_disconnected_or_terminated() {
+                self.set_status(InternalElectrumConnectionStatus::Disconnected, true);
             }
 
             // Sleep before retry to connect
@@ -336,7 +338,7 @@ impl InnerClient {
 
     async fn _try_connect(&self) -> Result<(BoxReadStream, BoxWriteStream), Error> {
         // Update status
-        self.set_status(ElectrumConnectionStatus::Connecting, true);
+        self.set_status(InternalElectrumConnectionStatus::Connecting, true);
 
         // Try to connect
         // If during connection the termination request is received, abort the connection and return error.
@@ -346,13 +348,13 @@ impl InnerClient {
             res = connect(&self.addr, self.config.connection_mode, self.config.connection_timeout) => match res {
                 Ok((reader, writer)) => {
                     // Update status
-                    self.set_status(ElectrumConnectionStatus::Connected, true);
+                    self.set_status(InternalElectrumConnectionStatus::Connected, true);
 
                     Ok((reader, writer))
                 }
                 Err(e) => {
                     // Update status
-                    self.set_status(ElectrumConnectionStatus::Disconnected, false);
+                    self.set_status(InternalElectrumConnectionStatus::Disconnected, false);
 
                     // Return error
                     Err(e)
@@ -669,10 +671,15 @@ impl ElectrumClient {
         self.inner.notification_sender.subscribe()
     }
 
+    #[inline]
+    fn internal_status(&self) -> InternalElectrumConnectionStatus {
+        self.inner.status()
+    }
+
     /// Get the current connection status
     #[inline]
     pub fn status(&self) -> ElectrumConnectionStatus {
-        self.inner.status()
+        self.internal_status().into()
     }
 
     /// Connect to the electrum server and keep the connection alive.
@@ -680,14 +687,14 @@ impl ElectrumClient {
     /// This automatically reconnects in case of disconnection.
     pub fn connect(&self) {
         // Immediately return if can't connect
-        if !self.status().can_connect() {
+        if !self.internal_status().can_connect() {
             return;
         }
 
         // Update status
         // Change it to pending to avoid issues with the health check (initialized check)
         self.inner
-            .set_status(ElectrumConnectionStatus::Pending, false);
+            .set_status(InternalElectrumConnectionStatus::Pending, false);
 
         // Spawn connection task
         self.spawn_connection_task();
@@ -710,7 +717,7 @@ impl ElectrumClient {
 
     /// Terminate connection with the electrum server
     pub fn disconnect(&self) {
-        let status = self.status();
+        let status = self.internal_status();
 
         // Check if it's already terminated or banned
         if status.is_terminated() {
@@ -722,7 +729,7 @@ impl ElectrumClient {
 
         // Update status
         self.inner
-            .set_status(ElectrumConnectionStatus::Terminated, true);
+            .set_status(InternalElectrumConnectionStatus::Terminated, true);
 
         // Shutdown all notification loops
         self.inner.send_notification(ElectrumNotification::Shutdown);
@@ -1187,7 +1194,7 @@ mod tests {
 
         time::sleep(Duration::from_secs(1)).await;
 
-        assert_eq!(inner.status(), ElectrumConnectionStatus::Terminated);
+        assert_eq!(inner.status(), InternalElectrumConnectionStatus::Terminated);
         assert!(!inner.is_running());
     }
 
@@ -1220,18 +1227,21 @@ mod tests {
     async fn test_connect_and_disconnect_guards() {
         let client = test_client();
         client.disconnect();
-        assert!(client.status().is_terminated());
+        assert!(client.internal_status().is_terminated());
 
         // No-op when already terminated.
         client.disconnect();
-        assert!(client.status().is_terminated());
+        assert!(client.internal_status().is_terminated());
 
         // No-op when status cannot connect.
         client
             .inner
-            .set_status(ElectrumConnectionStatus::Pending, false);
+            .set_status(InternalElectrumConnectionStatus::Pending, false);
         client.connect();
-        assert_eq!(client.status(), ElectrumConnectionStatus::Pending);
+        assert_eq!(
+            client.internal_status(),
+            InternalElectrumConnectionStatus::Pending
+        );
     }
 
     #[test]

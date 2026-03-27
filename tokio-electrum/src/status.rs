@@ -10,32 +10,32 @@ pub(super) struct AtomicElectrumConnectionStatus {
 
 impl Default for AtomicElectrumConnectionStatus {
     fn default() -> Self {
-        Self::new(ElectrumConnectionStatus::Initialized)
+        Self::new(InternalElectrumConnectionStatus::Initialized)
     }
 }
 
 impl AtomicElectrumConnectionStatus {
     #[inline]
-    pub(super) fn new(status: ElectrumConnectionStatus) -> Self {
+    pub(super) fn new(status: InternalElectrumConnectionStatus) -> Self {
         Self {
             value: AtomicU8::new(status as u8),
         }
     }
 
     #[inline]
-    pub fn set(&self, status: ElectrumConnectionStatus) {
+    pub fn set(&self, status: InternalElectrumConnectionStatus) {
         self.value.store(status as u8, Ordering::SeqCst);
     }
 
-    pub(super) fn load(&self) -> ElectrumConnectionStatus {
+    pub(super) fn load(&self) -> InternalElectrumConnectionStatus {
         let val: u8 = self.value.load(Ordering::SeqCst);
         match val {
-            0 => ElectrumConnectionStatus::Initialized,
-            1 => ElectrumConnectionStatus::Pending,
-            2 => ElectrumConnectionStatus::Connecting,
-            3 => ElectrumConnectionStatus::Connected,
-            4 => ElectrumConnectionStatus::Disconnected,
-            5 => ElectrumConnectionStatus::Terminated,
+            0 => InternalElectrumConnectionStatus::Initialized,
+            1 => InternalElectrumConnectionStatus::Pending,
+            2 => InternalElectrumConnectionStatus::Connecting,
+            3 => InternalElectrumConnectionStatus::Connected,
+            4 => InternalElectrumConnectionStatus::Disconnected,
+            5 => InternalElectrumConnectionStatus::Terminated,
             _ => unreachable!(),
         }
     }
@@ -43,7 +43,7 @@ impl AtomicElectrumConnectionStatus {
 
 /// Electrum connection status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ElectrumConnectionStatus {
+pub(crate) enum InternalElectrumConnectionStatus {
     /// The client has just been created.
     Initialized = 0,
     /// The client will try to connect shortly.
@@ -58,34 +58,10 @@ pub enum ElectrumConnectionStatus {
     Terminated = 5,
 }
 
-impl fmt::Display for ElectrumConnectionStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Initialized => write!(f, "Initialized"),
-            Self::Pending => write!(f, "Pending"),
-            Self::Connecting => write!(f, "Connecting"),
-            Self::Connected => write!(f, "Connected"),
-            Self::Disconnected => write!(f, "Disconnected"),
-            Self::Terminated => write!(f, "Terminated"),
-        }
-    }
-}
-
-impl ElectrumConnectionStatus {
-    // #[inline]
-    // pub(crate) fn is_initialized(&self) -> bool {
-    //     matches!(self, Self::Initialized)
-    // }
-
-    /// Check if it's connected.
-    #[inline]
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected)
-    }
-
+impl InternalElectrumConnectionStatus {
     /// Check if is `disconnected` or `terminated`.
     #[inline]
-    pub(crate) fn is_disconnected(&self) -> bool {
+    pub(crate) fn is_disconnected_or_terminated(&self) -> bool {
         matches!(self, Self::Disconnected | Self::Terminated)
     }
 
@@ -101,6 +77,62 @@ impl ElectrumConnectionStatus {
     }
 }
 
+impl From<InternalElectrumConnectionStatus> for ElectrumConnectionStatus {
+    fn from(status: InternalElectrumConnectionStatus) -> Self {
+        match status {
+            InternalElectrumConnectionStatus::Pending
+            | InternalElectrumConnectionStatus::Connecting => ElectrumConnectionStatus::Connecting,
+            InternalElectrumConnectionStatus::Connected => ElectrumConnectionStatus::Connected,
+            InternalElectrumConnectionStatus::Initialized
+            | InternalElectrumConnectionStatus::Disconnected
+            | InternalElectrumConnectionStatus::Terminated => {
+                ElectrumConnectionStatus::Disconnected
+            }
+        }
+    }
+}
+
+/// Electrum connection status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ElectrumConnectionStatus {
+    /// Trying to connecting.
+    Connecting = 2,
+    /// Connected.
+    Connected = 3,
+    /// The client is disconnected
+    Disconnected = 4,
+}
+
+impl fmt::Display for ElectrumConnectionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connecting => write!(f, "Connecting"),
+            Self::Connected => write!(f, "Connected"),
+            Self::Disconnected => write!(f, "Disconnected"),
+        }
+    }
+}
+
+impl ElectrumConnectionStatus {
+    /// Check if it's connecting.
+    #[inline]
+    pub fn is_connecting(&self) -> bool {
+        matches!(self, Self::Connecting)
+    }
+
+    /// Check if it's connected.
+    #[inline]
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    /// Check if it's disconnected.
+    #[inline]
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, Self::Disconnected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,79 +140,79 @@ mod tests {
     #[test]
     fn test_status_set() {
         let relay = AtomicElectrumConnectionStatus::default();
-        relay.set(ElectrumConnectionStatus::Connected);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Connected);
+        relay.set(InternalElectrumConnectionStatus::Connected);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Connected);
     }
 
     #[test]
     fn test_status_initialized() {
-        let status = ElectrumConnectionStatus::Initialized;
+        let status = InternalElectrumConnectionStatus::Initialized;
         // assert!(status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected());
+        assert!(!status.is_disconnected_or_terminated());
         assert!(!status.is_terminated());
         assert!(status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Initialized);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Initialized);
     }
 
     #[test]
     fn test_status_pending() {
-        let status = ElectrumConnectionStatus::Pending;
+        let status = InternalElectrumConnectionStatus::Pending;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected());
+        assert!(!status.is_disconnected_or_terminated());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Pending);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Pending);
     }
 
     #[test]
     fn test_status_connecting() {
-        let status = ElectrumConnectionStatus::Connecting;
+        let status = InternalElectrumConnectionStatus::Connecting;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected());
+        assert!(!status.is_disconnected_or_terminated());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Connecting);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Connecting);
     }
 
     #[test]
     fn test_status_connected() {
-        let status = ElectrumConnectionStatus::Connected;
+        let status = InternalElectrumConnectionStatus::Connected;
         // assert!(!status.is_initialized());
         // assert!(status.is_connected());
-        assert!(!status.is_disconnected());
+        assert!(!status.is_disconnected_or_terminated());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Connected);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Connected);
     }
 
     #[test]
     fn test_status_disconnected() {
-        let status = ElectrumConnectionStatus::Disconnected;
+        let status = InternalElectrumConnectionStatus::Disconnected;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(status.is_disconnected());
+        assert!(status.is_disconnected_or_terminated());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Disconnected);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Disconnected);
     }
 
     #[test]
     fn test_status_terminated() {
-        let status = ElectrumConnectionStatus::Terminated;
+        let status = InternalElectrumConnectionStatus::Terminated;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(status.is_disconnected());
+        assert!(status.is_disconnected_or_terminated());
         assert!(status.is_terminated());
         assert!(status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
-        assert_eq!(relay.load(), ElectrumConnectionStatus::Terminated);
+        assert_eq!(relay.load(), InternalElectrumConnectionStatus::Terminated);
     }
 }
