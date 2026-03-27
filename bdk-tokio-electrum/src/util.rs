@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use bdk_core::bitcoin::Txid;
 use bdk_core::bitcoin::hash_types::TxMerkleNode;
 use bdk_core::bitcoin::hashes::sha256d::Hash as Sha256d;
@@ -12,7 +14,7 @@ use tokio_electrum::prelude::*;
 ///
 /// [`transaction_get_merkle`]: crate::ElectrumApi::transaction_get_merkle
 /// [`BlockHeader`]: bitcoin::BlockHeader
-pub fn validate_merkle_proof(
+pub(crate) fn validate_merkle_proof(
     txid: &Txid,
     merkle_root: &TxMerkleNode,
     merkle_res: &TransactionMerkel,
@@ -35,4 +37,12 @@ pub fn validate_merkle_proof(
     }
 
     cur == merkle_root.to_raw_hash()
+}
+
+#[inline]
+pub(crate) fn log_scan_range<K>(keychain: &K, start_index: u32, end_index: u32)
+where
+    K: Display,
+{
+    tracing::info!("Finding transactions for `{keychain}` keychain [{start_index}-{end_index}]",);
 }

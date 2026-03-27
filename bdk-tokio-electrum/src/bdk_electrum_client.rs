@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -180,14 +181,17 @@ impl BdkElectrumClient {
     /// Internal implementation of full scan that optionally subscribes to scripts.
     ///
     /// When `subscribe` is true, it subscribes to all scripts with history and returns their hashes.
-    async fn internal_full_scan<K: Ord + Clone>(
+    async fn internal_full_scan<K>(
         &self,
         request: &mut FullScanRequest<K>,
         stop_gap: usize,
         batch_size: usize,
         fetch_prev_txouts: bool,
         subscribe: bool,
-    ) -> Result<(FullScanResponse<K>, HashSet<ElectrumScriptHash>), Error> {
+    ) -> Result<(FullScanResponse<K>, HashSet<ElectrumScriptHash>), Error>
+    where
+        K: Ord + Clone + Display,
+    {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
@@ -211,6 +215,7 @@ impl BdkElectrumClient {
                     stop_gap,
                     batch_size,
                     subscribe,
+                    &keychain,
                 )
                 .await?;
 
@@ -242,6 +247,8 @@ impl BdkElectrumClient {
             last_active_indices,
         };
 
+        tracing::info!("Finished loading.");
+
         Ok((response, all_subscribed_scripts))
     }
 
@@ -265,13 +272,16 @@ impl BdkElectrumClient {
     /// [`CalculateFeeError::MissingTxOut`]: ../bdk_chain/tx_graph/enum.CalculateFeeError.html#variant.MissingTxOut
     /// [`Wallet.calculate_fee`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee
     /// [`Wallet.calculate_fee_rate`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee_rate
-    pub async fn full_scan<K: Ord + Clone>(
+    pub async fn full_scan<K>(
         &self,
         request: impl Into<FullScanRequest<K>>,
         stop_gap: usize,
         batch_size: usize,
         fetch_prev_txouts: bool,
-    ) -> Result<FullScanResponse<K>, Error> {
+    ) -> Result<FullScanResponse<K>, Error>
+    where
+        K: Ord + Clone + Display,
+    {
         let mut request: FullScanRequest<K> = request.into();
         let (response, _) = self
             .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, false)
@@ -292,7 +302,7 @@ impl BdkElectrumClient {
         fetch_prev_txouts: bool,
     ) -> Result<(FullScanResponse<K>, SubscriptionStream), Error>
     where
-        K: Ord + Clone + Send + 'static,
+        K: Ord + Clone + Display + Send + 'static,
     {
         let mut request = request.into();
 
@@ -324,7 +334,7 @@ impl BdkElectrumClient {
         stop_gap: usize,
     ) -> SubscriptionStream
     where
-        K: Ord + Clone + Send + 'static,
+        K: Ord + Clone + Display + Send + 'static,
     {
         let client = self.clone();
         let notification_rx = self.inner.notifications();
@@ -395,7 +405,7 @@ impl BdkElectrumClient {
         ctx: &SubscriptionCtx<K>,
     ) -> Option<Result<SyncResponse<ConfirmationBlockTime>, Error>>
     where
-        K: Ord + Clone,
+        K: Ord + Clone + Display,
     {
         // Check if this script hash belongs to this wallet
         let has_script: bool = ctx.has_script(&hash).await;
@@ -437,7 +447,7 @@ impl BdkElectrumClient {
         ctx: &SubscriptionCtx<K>,
     ) -> Result<(), Error>
     where
-        K: Ord + Clone,
+        K: Ord + Clone + Display,
     {
         // Derive scripts to subscribe from new_active_index + 1 to new_active_index + stop_gap
         let scripts_to_subscribe: Vec<(ElectrumScriptHash, ScriptSubscription, u32)> = {
@@ -456,6 +466,12 @@ impl BdkElectrumClient {
 
         if scripts_to_subscribe.is_empty() {
             return Ok(());
+        }
+
+        if let (Some((_, _, start_index)), Some((_, _, end_index))) =
+            (scripts_to_subscribe.first(), scripts_to_subscribe.last())
+        {
+            util::log_scan_range(&keychain, *start_index, *end_index);
         }
 
         // Collect script hashes for subscription
@@ -493,6 +509,8 @@ impl BdkElectrumClient {
                 lookup.insert(*hash, (keychain.clone(), *index));
             }
         }
+
+        tracing::info!("Finished loading.");
 
         Ok(())
     }
@@ -574,7 +592,8 @@ impl BdkElectrumClient {
     ///
     /// If `subscribe` is true, also subscribes to scripts with history for real-time updates
     /// and returns the set of subscribed script hashes.
-    async fn populate_with_spks(
+    #[allow(clippy::too_many_arguments)]
+    async fn populate_with_spks<K>(
         &self,
         start_time: u64,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
@@ -582,7 +601,11 @@ impl BdkElectrumClient {
         stop_gap: usize,
         batch_size: usize,
         subscribe: bool,
-    ) -> Result<(Option<u32>, HashSet<ElectrumScriptHash>), Error> {
+        keychain: &K,
+    ) -> Result<(Option<u32>, HashSet<ElectrumScriptHash>), Error>
+    where
+        K: Display,
+    {
         let mut unused_spk_count = 0_usize;
         let mut last_active_index = Option::<u32>::None;
         let mut subscribed_hashes = HashSet::new();
@@ -591,8 +614,13 @@ impl BdkElectrumClient {
             let spks = (0..batch_size)
                 .map_while(|_| spks_with_expected_txids.next())
                 .collect::<Vec<_>>();
+
             if spks.is_empty() {
                 return Ok((last_active_index, subscribed_hashes));
+            }
+
+            if let (Some((start_index, _)), Some((end_index, _))) = (spks.first(), spks.last()) {
+                util::log_scan_range(&keychain, *start_index, *end_index);
             }
 
             let spk_histories = self
