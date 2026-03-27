@@ -8,13 +8,11 @@ use bdk_core::bitcoin::{BlockHash, Transaction, Txid};
 use bdk_core::spk_client::{FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncResponse};
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures::StreamExt;
-use futures::stream::BoxStream;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use futures::stream::{self, BoxStream};
+use tokio::sync::{Mutex, RwLock, broadcast};
 pub use tokio_electrum::client::{ElectrumClient, Error};
 use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::util;
 
@@ -82,6 +80,20 @@ where
 /// A stream that yields real-time updates from Electrum subscriptions.
 pub type SubscriptionStream =
     BoxStream<'static, Result<SyncResponse<ConfirmationBlockTime>, Error>>;
+
+/// Event yielded by [`BdkElectrumClient::subscribe`].
+#[derive(Debug)]
+pub enum SubscribeEvent<K> {
+    /// Initial full scan response emitted once at stream start.
+    Initial(FullScanResponse<K>),
+    /// Incremental update emitted for script hash and header notifications.
+    Update(SyncResponse<ConfirmationBlockTime>),
+    /// Connection has been disconnected and the stream will terminate.
+    Disconnected,
+}
+
+/// A stream that yields initial full-scan data and then real-time updates.
+pub type SubscribeStream<K> = BoxStream<'static, Result<SubscribeEvent<K>, Error>>;
 
 /// Wrapper around [`ElectrumClient`] which includes an internal in-memory
 /// transaction cache to avoid re-fetching already downloaded transactions.
@@ -207,6 +219,7 @@ impl BdkElectrumClient {
             let spks = request
                 .iter_spks(keychain.clone())
                 .map(|(spk_i, spk)| (spk_i, SpkWithExpectedTxids::from(spk)));
+
             let (last_active_index, subscribed_hashes) = self
                 .populate_with_spks(
                     start_time,
@@ -289,42 +302,49 @@ impl BdkElectrumClient {
         Ok(response)
     }
 
-    /// Full scan the keychain scripts with real-time subscription support.
+    /// Subscribe using a full scan request.
     ///
-    /// This method performs the same initial scan as [`full_scan`](Self::full_scan), but additionally
-    /// subscribes to each script pubkey that has transaction history. It returns both the initial
-    /// scan results and a stream of real-time updates.
-    pub async fn full_scan_and_subscribe<K>(
+    /// The returned stream first yields [`SubscribeEvent::Initial`] with the complete
+    /// [`FullScanResponse`], then yields [`SubscribeEvent::Update`] values for real-time changes.
+    /// On disconnection, it yields [`SubscribeEvent::Disconnected`] and then terminates.
+    pub async fn subscribe<K, R>(
         &self,
-        request: impl Into<FullScanRequest<K>>,
+        request: R,
         stop_gap: usize,
         batch_size: usize,
         fetch_prev_txouts: bool,
-    ) -> Result<(FullScanResponse<K>, SubscriptionStream), Error>
+    ) -> Result<SubscribeStream<K>, Error>
     where
+        R: Into<FullScanRequest<K>>,
         K: Ord + Clone + Display + Send + 'static,
     {
-        let mut request = request.into();
+        let mut request: FullScanRequest<K> = request.into();
+
+        let start_time: u64 = request.start_time();
+        let notification_rx = self.inner.notifications();
 
         let (response, all_subscribed_scripts) = self
             .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, true)
             .await?;
 
-        // Create the update stream with only the subscribed scripts
-        let stream = self.create_subscription_stream(
-            request.start_time(),
+        let live_stream = self.create_live_subscription_stream(
+            start_time,
             all_subscribed_scripts,
             fetch_prev_txouts,
             request,
             &response,
             stop_gap,
+            notification_rx,
         );
 
-        Ok((response, stream))
+        let initial_event = stream::once(async move { Ok(SubscribeEvent::Initial(response)) });
+
+        Ok(Box::pin(initial_event.chain(live_stream)))
     }
 
     /// Creates a stream that processes script hash and block header notifications.
-    fn create_subscription_stream<K>(
+    #[allow(clippy::too_many_arguments)]
+    fn create_live_subscription_stream<K>(
         &self,
         start_time: u64,
         subscribed_scripts: HashSet<ElectrumScriptHash>,
@@ -332,12 +352,12 @@ impl BdkElectrumClient {
         mut request: FullScanRequest<K>,
         response: &FullScanResponse<K>,
         stop_gap: usize,
-    ) -> SubscriptionStream
+        notification_rx: broadcast::Receiver<ElectrumNotification>,
+    ) -> SubscribeStream<K>
     where
         K: Ord + Clone + Display + Send + 'static,
     {
         let client = self.clone();
-        let notification_rx = self.inner.notifications();
 
         // Build a reverse lookup map
         let script_to_keychain_index = build_reverse_lookup_map(&mut request, response, stop_gap);
@@ -350,47 +370,68 @@ impl BdkElectrumClient {
             chain_tip: Mutex::new(response.chain_update.clone()),
         });
 
-        // Create a oneshot channel
-        let (tx, rx_done) = oneshot::channel();
-        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
+        let stream = stream::unfold(
+            (client, ctx, notification_rx, false),
+            move |(client, ctx, mut notification_rx, done)| async move {
+                if done {
+                    return None;
+                }
 
-        let stream = BroadcastStream::new(notification_rx).inspect(move |notification| {
-            if let Ok(ElectrumNotification::ConnectionStatusChanged(status)) = notification {
-                if status.is_disconnected() {
-                    // Take the sender and send the oneshot notification
-                    if let Some(tx) = tx.take() {
-                        let _ = tx.send(());
+                loop {
+                    match notification_rx.recv().await {
+                        Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
+                            if let Some(update) = client
+                                .handle_script_hash_notification(
+                                    hash,
+                                    start_time,
+                                    fetch_prev_txouts,
+                                    stop_gap,
+                                    &ctx,
+                                )
+                                .await
+                            {
+                                return Some((
+                                    update.map(SubscribeEvent::Update),
+                                    (client, ctx, notification_rx, false),
+                                ));
+                            }
+                        }
+                        Ok(ElectrumNotification::BlockHeader { height, header }) => {
+                            if let Some(update) =
+                                handle_block_header_notification(height, header, &ctx).await
+                            {
+                                return Some((
+                                    update.map(SubscribeEvent::Update),
+                                    (client, ctx, notification_rx, false),
+                                ));
+                            }
+                        }
+                        Ok(ElectrumNotification::ConnectionStatusChanged(status))
+                            if !status.is_connected() =>
+                        {
+                            // Terminate if the client is no longer connected
+                            return Some((
+                                Ok(SubscribeEvent::Disconnected),
+                                (client, ctx, notification_rx, true),
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                "Subscription stream lagged behind by {} messages - some updates may have been missed",
+                                n
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Some((
+                                Ok(SubscribeEvent::Disconnected),
+                                (client, ctx, notification_rx, true),
+                            ));
+                        }
                     }
                 }
-            }
-        }).filter_map(move |result| {
-            let client: BdkElectrumClient = client.clone();
-            let ctx: Arc<SubscriptionCtx<K>> = ctx.clone();
-
-            async move {
-                match result {
-                    Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
-                        client
-                            .handle_script_hash_notification(
-                                hash,
-                                start_time,
-                                fetch_prev_txouts,
-                                stop_gap,
-                                &ctx,
-                            )
-                            .await
-                    }
-                    Ok(ElectrumNotification::BlockHeader { height, header }) => {
-                        handle_block_header_notification(height, header, &ctx).await
-                    }
-                    Ok(_) => None,  // Ignore other notifications
-                    Err(BroadcastStreamRecvError::Lagged(n)) => {
-                        tracing::warn!("Subscription stream lagged behind by {} messages - some updates may have been missed", n);
-                        None
-                    }
-                }
-            }
-        }).take_until(rx_done);
+            },
+        );
 
         Box::pin(stream)
     }

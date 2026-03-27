@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bdk_core::bitcoin::Network;
-use bdk_tokio_electrum::BdkElectrumClient;
+use bdk_tokio_electrum::{BdkElectrumClient, SubscribeEvent};
 use bdk_wallet::Wallet;
 use futures::StreamExt;
 use tokio_electrum::prelude::*;
@@ -33,32 +33,28 @@ async fn main() {
             continue;
         }
 
-        println!("Starting full scan with subscriptions");
+        println!("Starting subscribe stream");
 
-        // Initial scan with subscriptions
+        // Unified subscribe stream: initial scan + real-time updates
         let request = wallet.start_full_scan().build();
-        let (initial_response, mut update_stream) = client
-            .full_scan_and_subscribe(request, 50, 5, false)
-            .await
-            .unwrap();
+        let mut stream = client.subscribe(request, 50, 20, false).await.unwrap();
 
-        println!("Full scan completed");
-
-        // Apply initial scan to your wallet
-        wallet.apply_update(initial_response).unwrap();
-
-        println!("Listening for updates");
-
-        // Listen for real-time updates
-        while let Some(update_result) = update_stream.next().await {
-            match update_result {
-                Ok(update) => {
-                    println!("Received tx update: {:?}", update);
-
-                    // Apply update to wallet
+        // Listen for initial and real-time updates
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(SubscribeEvent::Initial(initial)) => {
+                    println!("Initial full scan completed");
+                    wallet.apply_update(initial).unwrap();
+                }
+                Ok(SubscribeEvent::Update(update)) => {
+                    println!("Received update: {:?}", update);
                     wallet.apply_update(update).unwrap();
                 }
-                Err(e) => eprintln!("Update error: {}", e),
+                Ok(SubscribeEvent::Disconnected) => {
+                    println!("Disconnected. Stream terminated.");
+                    break;
+                }
+                Err(e) => eprintln!("Subscription error: {}", e),
             }
         }
 
