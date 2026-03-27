@@ -3,10 +3,8 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use bdk_core::bitcoin::block::Header;
-use bdk_core::bitcoin::{BlockHash, OutPoint, Transaction, Txid};
-use bdk_core::spk_client::{
-    FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncRequest, SyncResponse,
-};
+use bdk_core::bitcoin::{BlockHash, Transaction, Txid};
+use bdk_core::spk_client::{FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncResponse};
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -313,80 +311,6 @@ impl BdkElectrumClient {
         );
 
         Ok((response, stream))
-    }
-
-    /// Sync a set of scripts with the blockchain (via an Electrum client) for the data specified
-    /// and returns updates for [`bdk_chain`] data structures.
-    ///
-    /// - `request`: struct with data required to perform a spk-based blockchain client sync, see
-    ///   [`SyncRequest`]
-    /// - `batch_size`: specifies the max number of script pubkeys to request for in a single batch
-    ///   request
-    /// - `fetch_prev_txouts`: specifies whether we want previous `TxOut`s for fee calculation. Note
-    ///   that this requires additional calls to the Electrum server, but is necessary for
-    ///   calculating the fee on a transaction if your wallet does not own the inputs. Methods like
-    ///   [`Wallet.calculate_fee`] and [`Wallet.calculate_fee_rate`] will return a
-    ///   [`CalculateFeeError::MissingTxOut`] error if those `TxOut`s are not present in the
-    ///   transaction graph.
-    ///
-    /// If the scripts to sync are unknown, such as when restoring or importing a keychain that
-    /// may include scripts that have been used, use [`full_scan`] with the keychain.
-    ///
-    /// [`full_scan`]: Self::full_scan
-    /// [`bdk_chain`]: ../bdk_chain/index.html
-    /// [`CalculateFeeError::MissingTxOut`]: ../bdk_chain/tx_graph/enum.CalculateFeeError.html#variant.MissingTxOut
-    /// [`Wallet.calculate_fee`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee
-    /// [`Wallet.calculate_fee_rate`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee_rate
-    pub async fn sync<I: 'static>(
-        &self,
-        request: impl Into<SyncRequest<I>>,
-        batch_size: usize,
-        fetch_prev_txouts: bool,
-    ) -> Result<SyncResponse, Error> {
-        let mut request: SyncRequest<I> = request.into();
-        let start_time = request.start_time();
-
-        let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip).await?),
-            None => None,
-        };
-
-        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
-        self.populate_with_spks(
-            start_time,
-            &mut tx_update,
-            request
-                .iter_spks_with_expected_txids()
-                .enumerate()
-                .map(|(i, spk)| (i as u32, spk)),
-            usize::MAX,
-            batch_size,
-            false,
-        )
-        .await?;
-        self.populate_with_txids(start_time, &mut tx_update, request.iter_txids())
-            .await?;
-        self.populate_with_outpoints(start_time, &mut tx_update, request.iter_outpoints())
-            .await?;
-
-        // Fetch previous `TxOut`s for fee calculation if flag is enabled.
-        if fetch_prev_txouts {
-            self.fetch_prev_txout(&mut tx_update).await?;
-        }
-
-        let chain_update = match tip_and_latest_blocks {
-            Some((chain_tip, latest_blocks)) => Some(chain_update(
-                chain_tip,
-                &latest_blocks,
-                tx_update.anchors.iter().cloned(),
-            )?),
-            None => None,
-        };
-
-        Ok(SyncResponse {
-            tx_update,
-            chain_update,
-        })
     }
 
     /// Creates a stream that processes script hash and block header notifications.
@@ -738,126 +662,6 @@ impl BdkElectrumClient {
                     .await;
             }
         }
-    }
-
-    /// Populate the `tx_update` with associated transactions/anchors of `outpoints`.
-    ///
-    /// Transactions in which the outpoint resides, and transactions that spend from the outpoint
-    /// are included. Anchors of the aforementioned transactions are included.
-    async fn populate_with_outpoints(
-        &self,
-        start_time: u64,
-        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-        outpoints: impl IntoIterator<Item = OutPoint>,
-    ) -> Result<(), Error> {
-        for outpoint in outpoints {
-            let op_txid = outpoint.txid;
-            let op_tx = self.fetch_tx(op_txid).await?;
-            let op_txout = match op_tx.output.get(outpoint.vout as usize) {
-                Some(txout) => txout,
-                None => continue,
-            };
-            debug_assert_eq!(op_tx.compute_txid(), op_txid);
-
-            // attempt to find the following transactions (alongside their chain positions), and
-            // add to our sparsechain `update`:
-            let mut has_residing = false; // tx in which the outpoint resides
-            let mut has_spending = false; // tx that spends the outpoint
-            for res in self
-                .inner
-                .script_get_history(op_txout.script_pubkey.as_script())
-                .await?
-            {
-                if has_residing && has_spending {
-                    break;
-                }
-
-                if !has_residing && res.txid() == op_txid {
-                    has_residing = true;
-                    tx_update.txs.push(Arc::clone(&op_tx));
-                    match res.electrum_height().try_into() {
-                        // Returned heights 0 & -1 are reserved for unconfirmed txs.
-                        Ok(height) if height > 0 => {
-                            self.validate_merkle_for_anchor(tx_update, res.txid(), height)
-                                .await?;
-                        }
-                        _ => {
-                            tx_update.seen_ats.insert((res.txid(), start_time));
-                        }
-                    }
-                }
-
-                if !has_spending && res.txid() != op_txid {
-                    let res_tx = self.fetch_tx(res.txid()).await?;
-                    // we exclude txs/anchors that do not spend our specified outpoint(s)
-                    has_spending = res_tx
-                        .input
-                        .iter()
-                        .any(|txin| txin.previous_output == outpoint);
-                    if !has_spending {
-                        continue;
-                    }
-                    tx_update.txs.push(Arc::clone(&res_tx));
-                    match res.electrum_height().try_into() {
-                        // Returned heights 0 & -1 are reserved for unconfirmed txs.
-                        Ok(height) if height > 0 => {
-                            self.validate_merkle_for_anchor(tx_update, res.txid(), height)
-                                .await?;
-                        }
-                        _ => {
-                            tx_update.seen_ats.insert((res.txid(), start_time));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Populate the `tx_update` with transactions/anchors of the provided `txids`.
-    async fn populate_with_txids(
-        &self,
-        start_time: u64,
-        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-        txids: impl IntoIterator<Item = Txid>,
-    ) -> Result<(), Error> {
-        for txid in txids {
-            let tx = match self.fetch_tx(txid).await {
-                Ok(tx) => tx,
-                //Err(electrum_client::Error::Protocol(_)) => continue,
-                Err(other_err) => return Err(other_err),
-            };
-
-            let spk = tx
-                .output
-                .first()
-                .map(|txo| &txo.script_pubkey)
-                .expect("tx must have an output");
-
-            // because of restrictions of the Electrum API, we have to use the `script_get_history`
-            // call to get confirmation status of our transaction
-            if let Some(r) = self
-                .inner
-                .script_get_history(spk.as_script())
-                .await?
-                .into_iter()
-                .find(|r| r.txid() == txid)
-            {
-                match r.electrum_height().try_into() {
-                    // Returned heights 0 & -1 are reserved for unconfirmed txs.
-                    Ok(height) if height > 0 => {
-                        self.validate_merkle_for_anchor(tx_update, txid, height)
-                            .await?;
-                    }
-                    _ => {
-                        tx_update.seen_ats.insert((r.txid(), start_time));
-                    }
-                }
-            }
-
-            tx_update.txs.push(tx);
-        }
-        Ok(())
     }
 
     /// Subscribe to a batch of scripts via Electrum and update the subscription tracker.
