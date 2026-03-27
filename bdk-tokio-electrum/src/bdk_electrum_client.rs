@@ -199,7 +199,6 @@ impl BdkElectrumClient {
         stop_gap: usize,
         batch_size: usize,
         fetch_prev_txouts: bool,
-        subscribe: bool,
     ) -> Result<(FullScanResponse<K>, HashSet<ElectrumScriptHash>), Error>
     where
         K: Ord + Clone + Display,
@@ -227,7 +226,6 @@ impl BdkElectrumClient {
                     spks,
                     stop_gap,
                     batch_size,
-                    subscribe,
                     &keychain,
                 )
                 .await?;
@@ -265,49 +263,12 @@ impl BdkElectrumClient {
         Ok((response, all_subscribed_scripts))
     }
 
-    /// Full scan the keychain scripts specified with the blockchain (via an Electrum client) and
-    /// returns updates for [`bdk_chain`] data structures.
-    ///
-    /// - `request`: struct with data required to perform a spk-based blockchain client full scan,
-    ///   see [`FullScanRequest`].
-    /// - `stop_gap`: the full scan for each keychain stops after a gap of script pubkeys with no
-    ///   associated transactions.
-    /// - `batch_size`: specifies the max number of script pubkeys to request for in a single batch
-    ///   request.
-    /// - `fetch_prev_txouts`: specifies whether we want previous `TxOut`s for fee calculation. Note
-    ///   that this requires additional calls to the Electrum server, but is necessary for
-    ///   calculating the fee on a transaction if your wallet does not own the inputs. Methods like
-    ///   [`Wallet.calculate_fee`] and [`Wallet.calculate_fee_rate`] will return a
-    ///   [`CalculateFeeError::MissingTxOut`] error if those `TxOut`s are not present in the
-    ///   transaction graph.
-    ///
-    /// [`bdk_chain`]: ../bdk_chain/index.html
-    /// [`CalculateFeeError::MissingTxOut`]: ../bdk_chain/tx_graph/enum.CalculateFeeError.html#variant.MissingTxOut
-    /// [`Wallet.calculate_fee`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee
-    /// [`Wallet.calculate_fee_rate`]: ../bdk_wallet/struct.Wallet.html#method.calculate_fee_rate
-    pub async fn full_scan<K>(
-        &self,
-        request: impl Into<FullScanRequest<K>>,
-        stop_gap: usize,
-        batch_size: usize,
-        fetch_prev_txouts: bool,
-    ) -> Result<FullScanResponse<K>, Error>
-    where
-        K: Ord + Clone + Display,
-    {
-        let mut request: FullScanRequest<K> = request.into();
-        let (response, _) = self
-            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, false)
-            .await?;
-        Ok(response)
-    }
-
     /// Subscribe using a full scan request.
     ///
     /// The returned stream first yields [`SubscribeEvent::Initial`] with the complete
     /// [`FullScanResponse`], then yields [`SubscribeEvent::Update`] values for real-time changes.
     /// On disconnection, it yields [`SubscribeEvent::Disconnected`] and then terminates.
-    pub async fn subscribe<K, R>(
+    pub async fn sync<K, R>(
         &self,
         request: R,
         stop_gap: usize,
@@ -324,7 +285,7 @@ impl BdkElectrumClient {
         let notification_rx = self.inner.notifications();
 
         let (response, all_subscribed_scripts) = self
-            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts, true)
+            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts)
             .await?;
 
         let live_stream = self.create_live_subscription_stream(
@@ -641,7 +602,6 @@ impl BdkElectrumClient {
         mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
         stop_gap: usize,
         batch_size: usize,
-        subscribe: bool,
         keychain: &K,
     ) -> Result<(Option<u32>, HashSet<ElectrumScriptHash>), Error>
     where
@@ -678,7 +638,7 @@ impl BdkElectrumClient {
                     unused_spk_count = unused_spk_count.saturating_add(1);
                     if unused_spk_count >= stop_gap {
                         // Subscribe to collected scripts before returning
-                        if subscribe && !scripts_to_subscribe.is_empty() {
+                        if !scripts_to_subscribe.is_empty() {
                             self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
                                 .await;
                         }
@@ -688,14 +648,12 @@ impl BdkElectrumClient {
                     last_active_index = Some(spk_index);
                     unused_spk_count = 0;
 
-                    // Collect for subscription if enabled
-                    if subscribe {
-                        let script_hash = ElectrumScriptHash::new(&spk.spk);
-                        let spk_history_set: HashSet<Txid> =
-                            spk_history.iter().map(|res| res.txid()).collect();
-                        let subscription = ScriptSubscription::new(spk_history_set.clone());
-                        scripts_to_subscribe.push((script_hash, subscription));
-                    }
+                    // Collect for subscription
+                    let script_hash = ElectrumScriptHash::new(&spk.spk);
+                    let spk_history_set: HashSet<Txid> =
+                        spk_history.iter().map(|res| res.txid()).collect();
+                    let subscription = ScriptSubscription::new(spk_history_set.clone());
+                    scripts_to_subscribe.push((script_hash, subscription));
                 }
 
                 let spk_history_set = spk_history
@@ -726,7 +684,7 @@ impl BdkElectrumClient {
             }
 
             // Subscribe to all scripts with history in this batch
-            if subscribe && !scripts_to_subscribe.is_empty() {
+            if !scripts_to_subscribe.is_empty() {
                 self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
                     .await;
             }

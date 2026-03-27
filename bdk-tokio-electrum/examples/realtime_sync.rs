@@ -37,7 +37,7 @@ async fn main() {
 
         // Unified subscribe stream: initial scan + real-time updates
         let request = wallet.start_full_scan().build();
-        let mut stream = client.subscribe(request, 50, 20, false).await.unwrap();
+        let mut stream = client.sync(request, 50, 20, false).await.unwrap();
 
         // Listen for initial and real-time updates
         while let Some(event) = stream.next().await {
