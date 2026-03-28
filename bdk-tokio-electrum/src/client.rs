@@ -216,14 +216,18 @@ where
 /// Information about a subscribed script
 #[derive(Debug, Clone)]
 struct ScriptSubscription {
-    /// The set of transaction IDs we've seen for this script
-    expected_txids: HashSet<Txid>,
+    /// The expected transaction status keyed by txid.
+    ///
+    /// Value is the Electrum height encoding (`>0` confirmed, `0/-1` mempool states).
+    expected_tx_heights: HashMap<Txid, i64>,
 }
 
 impl ScriptSubscription {
     #[inline]
-    fn new(expected_txids: HashSet<Txid>) -> Self {
-        Self { expected_txids }
+    fn new(expected_tx_heights: HashMap<Txid, i64>) -> Self {
+        Self {
+            expected_tx_heights,
+        }
     }
 }
 
@@ -847,7 +851,7 @@ impl BdkElectrumClient {
             for (hash, _) in &scripts_to_subscribe {
                 tracker
                     .entry(*hash)
-                    .or_insert_with(|| ScriptSubscription::new(HashSet::new()));
+                    .or_insert_with(|| ScriptSubscription::new(HashMap::new()));
             }
         }
 
@@ -879,16 +883,22 @@ impl BdkElectrumClient {
         };
         drop(tracker);
 
-        let expected_txids: HashSet<Txid> = subscription.expected_txids;
+        let expected_tx_heights: HashMap<Txid, i64> = subscription.expected_tx_heights;
 
         // Fetch current history for this script
         let history = self.inner.script_get_history(script_hash).await?;
-        let current_txids: HashSet<Txid> = history.iter().map(|tx| tx.txid()).collect();
+        let current_tx_heights: HashMap<Txid, i64> = history
+            .iter()
+            .map(|tx| (tx.txid(), tx.electrum_height()))
+            .collect();
 
-        // Check if there are any changes
-        if current_txids == expected_txids {
+        // Check if there are any changes (new/evicted txs or status transitions).
+        if current_tx_heights == expected_tx_heights {
             return Ok(None);
         }
+
+        let expected_txids: HashSet<Txid> = expected_tx_heights.keys().copied().collect();
+        let current_txids: HashSet<Txid> = current_tx_heights.keys().copied().collect();
 
         // Build a TxUpdate with the changes
         let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
@@ -900,17 +910,25 @@ impl BdkElectrumClient {
 
         // Fetch new transactions
         for tx_res in history {
-            if !expected_txids.contains(&tx_res.txid()) {
-                let tx: Arc<Transaction> = self.fetch_tx(tx_res.txid()).await?;
-                tx_update.txs.push(tx);
+            let txid = tx_res.txid();
+            let electrum_height = tx_res.electrum_height();
+            let previous_height = expected_tx_heights.get(&txid).copied();
+            let is_new_tx = previous_height.is_none();
+            let status_changed = previous_height.is_some_and(|h| h != electrum_height);
 
-                match tx_res.electrum_height().try_into() {
+            if is_new_tx {
+                let tx: Arc<Transaction> = self.fetch_tx(txid).await?;
+                tx_update.txs.push(tx);
+            }
+
+            if is_new_tx || status_changed {
+                match electrum_height.try_into() {
                     Ok(height) if height > 0 => {
-                        self.validate_merkle_for_anchor(&mut tx_update, tx_res.txid(), height)
+                        self.validate_merkle_for_anchor(&mut tx_update, txid, height)
                             .await?;
                     }
                     _ => {
-                        tx_update.seen_ats.insert((tx_res.txid(), start_time));
+                        tx_update.seen_ats.insert((txid, start_time));
                     }
                 }
             }
@@ -924,7 +942,7 @@ impl BdkElectrumClient {
         // Update our tracker with the new expected txids
         let mut tracker = self.subscription_tracker.lock().await;
         if let Some(subscription) = tracker.get_mut(&script_hash) {
-            subscription.expected_txids = current_txids;
+            subscription.expected_tx_heights = current_tx_heights;
         }
 
         Ok(Some(SyncResponse {
@@ -986,13 +1004,17 @@ impl BdkElectrumClient {
             let mut batch_loaded_indexes: BTreeSet<u32> = BTreeSet::new();
 
             for ((spk_index, spk), spk_history) in spks.into_iter().zip(spk_histories) {
-                let spk_history_set: HashSet<Txid> =
-                    spk_history.iter().map(|res| res.txid()).collect();
+                let spk_history_heights: HashMap<Txid, i64> = spk_history
+                    .iter()
+                    .map(|res| (res.txid(), res.electrum_height()))
+                    .collect();
+                let spk_history_txids: HashSet<Txid> =
+                    spk_history_heights.keys().copied().collect();
                 let script_hash = ElectrumScriptHash::new(&spk.spk);
                 scripts_to_subscribe.push((
                     script_hash,
                     spk_index,
-                    ScriptSubscription::new(spk_history_set.clone()),
+                    ScriptSubscription::new(spk_history_heights.clone()),
                 ));
                 result.max_subscribed_index = Some(
                     result
@@ -1013,7 +1035,7 @@ impl BdkElectrumClient {
 
                 tx_update.evicted_ats.extend(
                     spk.expected_txids
-                        .difference(&spk_history_set)
+                        .difference(&spk_history_txids)
                         .map(|&txid| (txid, start_time)),
                 );
 
@@ -2250,6 +2272,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_stream_marks_pending_tx_confirmed_after_new_block() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(22_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_pending = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .seen_ats
+                            .iter()
+                            .any(|(seen_txid, _)| *seen_txid == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_pending,
+            "expected pending update for mempool transaction"
+        );
+
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let new_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(new_height);
+
+        let saw_confirmation_anchor = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .anchors
+                            .iter()
+                            .any(|(_, anchor_txid)| *anchor_txid == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_confirmation_anchor,
+            "expected confirmation anchor after transaction is mined"
+        );
+    }
+
+    #[tokio::test]
     async fn sync_stream_emits_disconnected_event_on_disconnect() {
         let env = TestEnv::new();
         let client = connected_bdk_client(&env).await;
@@ -2405,7 +2518,7 @@ mod tests {
         let client = test_bdk_client();
         let mut subscribed_hashes = HashSet::new();
         let hash = ElectrumScriptHash::new(&script(0x71));
-        let scripts = vec![(hash, 0, ScriptSubscription::new(HashSet::new()))];
+        let scripts = vec![(hash, 0, ScriptSubscription::new(HashMap::new()))];
 
         let mut saturated = false;
         for i in 0..10_000_u32 {
@@ -2751,7 +2864,7 @@ mod tests {
                 let hash = ElectrumScriptHash::new(&script(tag));
                 scripts.insert(hash);
                 lookup.insert(hash, ("external".to_string(), index));
-                tracker.insert(hash, ScriptSubscription::new(HashSet::new()));
+                tracker.insert(hash, ScriptSubscription::new(HashMap::new()));
             }
         }
         {
