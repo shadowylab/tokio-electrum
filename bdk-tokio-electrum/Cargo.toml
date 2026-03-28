@@ -13,7 +13,7 @@ keywords = ["bitcoin", "bdk", "electrum", "tokio"]
 [dependencies]
 bdk_core = "0.6"
 futures = "0.3"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tokio-electrum = { path = "../tokio-electrum", version = "0.1" }
 tracing.workspace = true
 

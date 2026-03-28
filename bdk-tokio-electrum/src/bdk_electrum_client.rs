@@ -1,15 +1,18 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bdk_core::bitcoin::block::Header;
 use bdk_core::bitcoin::{BlockHash, Transaction, Txid};
 use bdk_core::spk_client::{FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncResponse};
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::time::{Instant, timeout_at};
 pub use tokio_electrum::client::{ElectrumClient, Error};
 use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
@@ -18,33 +21,18 @@ use crate::util;
 
 /// We include a chain suffix of a certain length for the purpose of robustness.
 const CHAIN_SUFFIX_LENGTH: u32 = 8;
-
-/// Information about a subscribed script
-#[derive(Debug, Clone)]
-struct ScriptSubscription {
-    /// The set of transaction IDs we've seen for this script
-    expected_txids: HashSet<Txid>,
-}
-
-impl ScriptSubscription {
-    #[inline]
-    fn new(expected_txids: HashSet<Txid>) -> Self {
-        Self { expected_txids }
-    }
-}
-
-/// Tracks script subscriptions with their expected txids for diffing updates
-#[derive(Debug, Clone, Default)]
-struct SubscriptionTracker {
-    /// Maps script hash to subscription information
-    scripts: Arc<Mutex<HashMap<ElectrumScriptHash, ScriptSubscription>>>,
-}
+const DEFAULT_STOP_GAP: usize = 50;
+const DEFAULT_BATCH_SIZE: usize = 20;
+const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(1500);
+const DEFAULT_WALLET_LABEL: &str = "unlabeled";
 
 struct SubscriptionCtx<K> {
+    wallet_label: String,
     request: Mutex<FullScanRequest<K>>,
     subscribed_scripts: Mutex<HashSet<ElectrumScriptHash>>,
     script_to_keychain_index: Mutex<HashMap<ElectrumScriptHash, (K, u32)>>,
     last_active_indices: Mutex<BTreeMap<K, u32>>,
+    max_subscribed_indices: Mutex<BTreeMap<K, u32>>,
     chain_tip: Mutex<Option<CheckPoint>>,
 }
 
@@ -62,12 +50,12 @@ where
         lookup.get(hash).cloned()
     }
 
-    async fn needs_extension(&self, hash: &ElectrumScriptHash) -> Option<(K, u32)> {
+    async fn extension_target(&self, hash: &ElectrumScriptHash) -> Option<(K, u32)> {
         let (keychain, current_index) = self.keychain_index(hash).await?;
 
-        // Check if we need to extend subscriptions for this keychain
+        // Extend only when this script index moved beyond the known last-active index.
         let last_active = self.last_active_indices.lock().await;
-        let last: u32 = last_active.get(&keychain).copied().unwrap_or(0);
+        let last: u32 = last_active.get(&keychain).copied()?;
 
         if current_index > last {
             Some((keychain, current_index))
@@ -75,6 +63,46 @@ where
             None
         }
     }
+
+    async fn tracked_script_hashes(&self) -> Vec<ElectrumScriptHash> {
+        let scripts = self.subscribed_scripts.lock().await;
+        scripts.iter().copied().collect()
+    }
+}
+
+#[derive(Default)]
+struct PendingBatch {
+    dirty_scripts: HashSet<ElectrumScriptHash>,
+    latest_header: Option<(u32, Header)>,
+    lagged: bool,
+    disconnected: bool,
+}
+
+impl PendingBatch {
+    fn has_work(&self) -> bool {
+        self.lagged || !self.dirty_scripts.is_empty() || self.latest_header.is_some()
+    }
+}
+
+struct SubscriptionInit<K> {
+    subscribed_scripts: HashSet<ElectrumScriptHash>,
+    script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)>,
+    max_subscribed_indices: BTreeMap<K, u32>,
+}
+
+struct SpkScanResult {
+    last_active_index: Option<u32>,
+    subscribed_hashes: HashSet<ElectrumScriptHash>,
+    subscribed_script_to_index: HashMap<ElectrumScriptHash, u32>,
+    max_subscribed_index: Option<u32>,
+}
+
+struct LiveStreamState<K> {
+    client: BdkElectrumClient,
+    ctx: Arc<SubscriptionCtx<K>>,
+    notification_rx: broadcast::Receiver<ElectrumNotification>,
+    pending_disconnect: bool,
+    done: bool,
 }
 
 /// A stream that yields real-time updates from Electrum subscriptions.
@@ -95,6 +123,110 @@ pub enum SubscribeEvent<K> {
 /// A stream that yields initial full-scan data and then real-time updates.
 pub type SubscribeStream<K> = BoxStream<'static, Result<SubscribeEvent<K>, Error>>;
 
+/// Sync wallet API
+#[must_use = "Does nothing unless you await!"]
+pub struct SyncWallet<'client, K> {
+    client: &'client BdkElectrumClient,
+    request: FullScanRequest<K>,
+    stop_gap: usize,
+    batch_size: usize,
+    fetch_prev_txouts: bool,
+    batch_window: Duration,
+    label: String,
+}
+
+impl<'client, K> SyncWallet<'client, K>
+where
+    K: Ord + Clone + Display + Send + 'static,
+{
+    pub(crate) fn new(client: &'client BdkElectrumClient, request: FullScanRequest<K>) -> Self {
+        Self {
+            client,
+            request,
+            stop_gap: DEFAULT_STOP_GAP,
+            batch_size: DEFAULT_BATCH_SIZE,
+            fetch_prev_txouts: false,
+            batch_window: DEFAULT_BATCH_WINDOW,
+            label: DEFAULT_WALLET_LABEL.to_string(),
+        }
+    }
+
+    /// Set a stop gap (default: 50)
+    #[inline]
+    pub fn stop_gap(mut self, stop_gap: usize) -> Self {
+        self.stop_gap = stop_gap;
+        self
+    }
+
+    /// Set a batch size (default: 20)
+    #[inline]
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Enable fetching of previous transaction outputs (default: false)
+    #[inline]
+    pub fn fetch_prev_txouts(mut self, fetch_prev_txouts: bool) -> Self {
+        self.fetch_prev_txouts = fetch_prev_txouts;
+        self
+    }
+
+    /// Set a batch window (default: 250ms)
+    #[inline]
+    pub fn batch_window(mut self, batch_window: Duration) -> Self {
+        self.batch_window = batch_window;
+        self
+    }
+
+    /// Set a wallet label for logs (default: unlabeled)
+    #[inline]
+    pub fn label<T>(mut self, label: T) -> Self
+    where
+        T: Into<String>,
+    {
+        self.label = label.into();
+        self
+    }
+}
+
+impl<'client, K> IntoFuture for SyncWallet<'client, K>
+where
+    K: Ord + Clone + Display + Send + Sync + 'static,
+{
+    type Output = Result<SubscribeStream<K>, Error>;
+    type IntoFuture = BoxFuture<'client, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            self.client
+                .run_sync(
+                    self.request,
+                    self.stop_gap,
+                    self.batch_size,
+                    self.fetch_prev_txouts,
+                    self.batch_window,
+                    self.label,
+                )
+                .await
+        })
+    }
+}
+
+/// Information about a subscribed script
+#[derive(Debug, Clone)]
+struct ScriptSubscription {
+    /// The set of transaction IDs we've seen for this script
+    expected_txids: HashSet<Txid>,
+}
+
+impl ScriptSubscription {
+    #[inline]
+    fn new(expected_txids: HashSet<Txid>) -> Self {
+        Self { expected_txids }
+    }
+}
+
 /// Wrapper around [`ElectrumClient`] which includes an internal in-memory
 /// transaction cache to avoid re-fetching already downloaded transactions.
 #[derive(Debug, Clone)]
@@ -105,8 +237,8 @@ pub struct BdkElectrumClient {
     tx_cache: Arc<RwLock<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
     block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
-    /// Subscription tracker for real-time sync
-    subscription_tracker: SubscriptionTracker,
+    /// Maps script hash to subscription information
+    subscription_tracker: Arc<Mutex<HashMap<ElectrumScriptHash, ScriptSubscription>>>,
 }
 
 impl Deref for BdkElectrumClient {
@@ -190,37 +322,42 @@ impl BdkElectrumClient {
         Ok(header)
     }
 
-    /// Internal implementation of full scan that optionally subscribes to scripts.
-    ///
-    /// When `subscribe` is true, it subscribes to all scripts with history and returns their hashes.
+    /// Run initial full scan and build subscription bootstrap state for live updates.
     async fn internal_full_scan<K>(
         &self,
+        wallet_label: &str,
         request: &mut FullScanRequest<K>,
         stop_gap: usize,
         batch_size: usize,
         fetch_prev_txouts: bool,
-    ) -> Result<(FullScanResponse<K>, HashSet<ElectrumScriptHash>), Error>
+    ) -> Result<(FullScanResponse<K>, SubscriptionInit<K>), Error>
     where
         K: Ord + Clone + Display,
     {
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => Some(fetch_tip_and_latest_blocks(&self.inner, chain_tip).await?),
+            Some(chain_tip) => {
+                Some(fetch_tip_and_latest_blocks(wallet_label, &self.inner, chain_tip).await?)
+            }
             None => None,
         };
 
         let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
         let mut last_active_indices: BTreeMap<K, u32> = BTreeMap::default();
         let mut all_subscribed_scripts: HashSet<ElectrumScriptHash> = HashSet::new();
+        let mut all_script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)> =
+            HashMap::new();
+        let mut max_subscribed_indices: BTreeMap<K, u32> = BTreeMap::new();
 
         for keychain in request.keychains() {
             let spks = request
                 .iter_spks(keychain.clone())
                 .map(|(spk_i, spk)| (spk_i, SpkWithExpectedTxids::from(spk)));
 
-            let (last_active_index, subscribed_hashes) = self
+            let spk_scan = self
                 .populate_with_spks(
+                    wallet_label,
                     start_time,
                     &mut tx_update,
                     spks,
@@ -230,12 +367,19 @@ impl BdkElectrumClient {
                 )
                 .await?;
 
-            if let Some(last_active_index) = last_active_index {
-                last_active_indices.insert(keychain, last_active_index);
+            if let Some(last_active_index) = spk_scan.last_active_index {
+                last_active_indices.insert(keychain.clone(), last_active_index);
             }
 
             // Collect all subscribed script hashes
-            all_subscribed_scripts.extend(subscribed_hashes);
+            all_subscribed_scripts.extend(spk_scan.subscribed_hashes);
+
+            for (hash, index) in spk_scan.subscribed_script_to_index {
+                all_script_to_keychain_index.insert(hash, (keychain.clone(), index));
+            }
+            if let Some(max_subscribed_index) = spk_scan.max_subscribed_index {
+                max_subscribed_indices.insert(keychain.clone(), max_subscribed_index);
+            }
         }
 
         // Fetch previous `TxOut`s for fee calculation if flag is enabled.
@@ -258,146 +402,296 @@ impl BdkElectrumClient {
             last_active_indices,
         };
 
-        tracing::info!("Finished loading.");
+        tracing::info!(wallet = %wallet_label, "Finished loading.");
 
-        Ok((response, all_subscribed_scripts))
+        Ok((
+            response,
+            SubscriptionInit {
+                subscribed_scripts: all_subscribed_scripts,
+                script_to_keychain_index: all_script_to_keychain_index,
+                max_subscribed_indices,
+            },
+        ))
     }
 
     /// Subscribe using a full scan request.
     ///
     /// The returned stream first yields [`SubscribeEvent::Initial`] with the complete
-    /// [`FullScanResponse`], then yields [`SubscribeEvent::Update`] values for real-time changes.
+    /// [`FullScanResponse`], then yields batched [`SubscribeEvent::Update`] values.
     /// On disconnection, it yields [`SubscribeEvent::Disconnected`] and then terminates.
-    pub async fn sync<K, R>(
-        &self,
-        request: R,
-        stop_gap: usize,
-        batch_size: usize,
-        fetch_prev_txouts: bool,
-    ) -> Result<SubscribeStream<K>, Error>
+    pub fn sync<K, R>(&self, request: R) -> SyncWallet<'_, K>
     where
         R: Into<FullScanRequest<K>>,
         K: Ord + Clone + Display + Send + 'static,
     {
-        let mut request: FullScanRequest<K> = request.into();
+        SyncWallet::new(self, request.into())
+    }
 
+    async fn run_sync<K>(
+        &self,
+        mut request: FullScanRequest<K>,
+        stop_gap: usize,
+        batch_size: usize,
+        fetch_prev_txouts: bool,
+        batch_window: Duration,
+        wallet_label: String,
+    ) -> Result<SubscribeStream<K>, Error>
+    where
+        K: Ord + Clone + Display + Send + 'static,
+    {
         let start_time: u64 = request.start_time();
         let notification_rx = self.inner.notifications();
 
-        let (response, all_subscribed_scripts) = self
-            .internal_full_scan(&mut request, stop_gap, batch_size, fetch_prev_txouts)
+        tracing::info!(wallet = %wallet_label, "Wallet loading history.");
+
+        let (response, subscription_init) = self
+            .internal_full_scan(
+                &wallet_label,
+                &mut request,
+                stop_gap,
+                batch_size,
+                fetch_prev_txouts,
+            )
             .await?;
 
         let live_stream = self.create_live_subscription_stream(
+            wallet_label,
             start_time,
-            all_subscribed_scripts,
+            subscription_init,
             fetch_prev_txouts,
             request,
             &response,
             stop_gap,
             notification_rx,
+            batch_window,
         );
 
         let initial_event = stream::once(async move { Ok(SubscribeEvent::Initial(response)) });
-
         Ok(Box::pin(initial_event.chain(live_stream)))
     }
 
-    /// Creates a stream that processes script hash and block header notifications.
+    /// Creates a stream that batches script hash and block header notifications.
     #[allow(clippy::too_many_arguments)]
     fn create_live_subscription_stream<K>(
         &self,
+        wallet_label: String,
         start_time: u64,
-        subscribed_scripts: HashSet<ElectrumScriptHash>,
+        subscription_init: SubscriptionInit<K>,
         fetch_prev_txouts: bool,
-        mut request: FullScanRequest<K>,
+        request: FullScanRequest<K>,
         response: &FullScanResponse<K>,
         stop_gap: usize,
         notification_rx: broadcast::Receiver<ElectrumNotification>,
+        batch_window: Duration,
     ) -> SubscribeStream<K>
     where
         K: Ord + Clone + Display + Send + 'static,
     {
         let client = self.clone();
 
-        // Build a reverse lookup map
-        let script_to_keychain_index = build_reverse_lookup_map(&mut request, response, stop_gap);
-
         let ctx = Arc::new(SubscriptionCtx {
+            wallet_label,
             request: Mutex::new(request),
-            subscribed_scripts: Mutex::new(subscribed_scripts),
-            script_to_keychain_index: Mutex::new(script_to_keychain_index),
+            subscribed_scripts: Mutex::new(subscription_init.subscribed_scripts),
+            script_to_keychain_index: Mutex::new(subscription_init.script_to_keychain_index),
             last_active_indices: Mutex::new(response.last_active_indices.clone()),
+            max_subscribed_indices: Mutex::new(subscription_init.max_subscribed_indices),
             chain_tip: Mutex::new(response.chain_update.clone()),
         });
 
-        let stream = stream::unfold(
-            (client, ctx, notification_rx, false),
-            move |(client, ctx, mut notification_rx, done)| async move {
-                if done {
-                    return None;
-                }
+        let initial_state = LiveStreamState {
+            client,
+            ctx,
+            notification_rx,
+            pending_disconnect: false,
+            done: false,
+        };
+        let stream = stream::unfold(initial_state, move |mut state| async move {
+            if state.done {
+                return None;
+            }
+
+            if state.pending_disconnect {
+                state.pending_disconnect = false;
+                state.done = true;
+                return Some((Ok(SubscribeEvent::Disconnected), state));
+            }
+
+            loop {
+                let mut batch = PendingBatch::default();
 
                 loop {
-                    match notification_rx.recv().await {
-                        Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
-                            if let Some(update) = client
-                                .handle_script_hash_notification(
-                                    hash,
-                                    start_time,
-                                    fetch_prev_txouts,
-                                    stop_gap,
-                                    &ctx,
-                                )
-                                .await
-                            {
-                                return Some((
-                                    update.map(SubscribeEvent::Update),
-                                    (client, ctx, notification_rx, false),
-                                ));
+                    let received = state.notification_rx.recv().await;
+                    state
+                        .client
+                        .collect_batch_notification(&state.ctx, received, &mut batch)
+                        .await;
+                    if batch.disconnected || batch.has_work() {
+                        break;
+                    }
+                }
+
+                if !batch.disconnected {
+                    let deadline: Instant = Instant::now() + batch_window;
+
+                    #[allow(clippy::while_let_loop)]
+                    loop {
+                        match timeout_at(deadline, state.notification_rx.recv()).await {
+                            Ok(received) => {
+                                state
+                                    .client
+                                    .collect_batch_notification(&state.ctx, received, &mut batch)
+                                    .await;
+                                if batch.disconnected {
+                                    break;
+                                }
                             }
-                        }
-                        Ok(ElectrumNotification::BlockHeader { height, header }) => {
-                            if let Some(update) =
-                                handle_block_header_notification(height, header, &ctx).await
-                            {
-                                return Some((
-                                    update.map(SubscribeEvent::Update),
-                                    (client, ctx, notification_rx, false),
-                                ));
-                            }
-                        }
-                        Ok(ElectrumNotification::ConnectionStatusChanged(status))
-                            if !status.is_connected() =>
-                        {
-                            // Terminate if the client is no longer connected
-                            return Some((
-                                Ok(SubscribeEvent::Disconnected),
-                                (client, ctx, notification_rx, true),
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                "Subscription stream lagged behind by {} messages - some updates may have been missed",
-                                n
-                            );
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            return Some((
-                                Ok(SubscribeEvent::Disconnected),
-                                (client, ctx, notification_rx, true),
-                            ));
+                            Err(_) => break,
                         }
                     }
                 }
-            },
-        );
+
+                match state
+                    .client
+                    .build_sync_update_from_batch(
+                        start_time,
+                        fetch_prev_txouts,
+                        stop_gap,
+                        &state.ctx,
+                        &mut batch,
+                    )
+                    .await
+                {
+                    Ok(Some(update)) => {
+                        state.pending_disconnect = batch.disconnected;
+                        return Some((Ok(SubscribeEvent::Update(update)), state));
+                    }
+                    Ok(None) if batch.disconnected => {
+                        state.done = true;
+                        return Some((Ok(SubscribeEvent::Disconnected), state));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        state.done = true;
+                        return Some((Err(e), state));
+                    }
+                }
+            }
+        });
 
         Box::pin(stream)
     }
 
-    /// Handle script hash notification and check if we need to subscribe to new addresses
+    async fn collect_batch_notification<K>(
+        &self,
+        ctx: &SubscriptionCtx<K>,
+        received: Result<ElectrumNotification, broadcast::error::RecvError>,
+        batch: &mut PendingBatch,
+    ) where
+        K: Ord + Clone,
+    {
+        match received {
+            Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
+                if ctx.has_script(&hash).await {
+                    batch.dirty_scripts.insert(hash);
+                }
+            }
+            Ok(ElectrumNotification::BlockHeader { height, header }) => {
+                batch.latest_header = Some((height, header));
+            }
+            Ok(ElectrumNotification::ConnectionStatusChanged(status)) if !status.is_connected() => {
+                batch.disconnected = true;
+            }
+            Ok(ElectrumNotification::Shutdown) => {
+                batch.disconnected = true;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    wallet = %ctx.wallet_label,
+                    "Subscription stream lagged by {} notifications, triggering catch-up batch",
+                    n
+                );
+                batch.lagged = true;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                batch.disconnected = true;
+            }
+        }
+    }
+
+    async fn build_sync_update_from_batch<K>(
+        &self,
+        start_time: u64,
+        fetch_prev_txouts: bool,
+        stop_gap: usize,
+        ctx: &SubscriptionCtx<K>,
+        batch: &mut PendingBatch,
+    ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error>
+    where
+        K: Ord + Clone + Display,
+    {
+        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+        let mut chain_update = None;
+
+        if let Some((height, header)) = batch.latest_header.take() {
+            match handle_block_header_notification(height, header, ctx).await {
+                Some(Ok(update)) => {
+                    chain_update = update.chain_update;
+                }
+                Some(Err(Error::Disconnected)) => {
+                    batch.disconnected = true;
+                }
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+        }
+
+        let scripts_to_process: Vec<ElectrumScriptHash> = if batch.lagged {
+            ctx.tracked_script_hashes().await
+        } else {
+            batch.dirty_scripts.drain().collect()
+        };
+        batch.lagged = false;
+
+        for hash in scripts_to_process {
+            match self
+                .handle_script_hash_notification(hash, start_time, fetch_prev_txouts, stop_gap, ctx)
+                .await
+            {
+                Some(Ok(update)) => {
+                    tx_update.extend(update.tx_update);
+                }
+                Some(Err(Error::Disconnected)) => {
+                    batch.disconnected = true;
+                    break;
+                }
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+        }
+
+        if tx_update.is_empty() && chain_update.is_none() {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            wallet = %ctx.wallet_label,
+            tx_count = tx_update.txs.len(),
+            anchor_count = tx_update.anchors.len(),
+            seen_count = tx_update.seen_ats.len(),
+            evicted_count = tx_update.evicted_ats.len(),
+            has_chain_update = chain_update.is_some(),
+            "Emitting realtime sync batch."
+        );
+
+        Ok(Some(SyncResponse {
+            tx_update,
+            chain_update,
+        }))
+    }
+
+    /// Handle script hash notification and extend subscriptions when a higher index turns active.
     async fn handle_script_hash_notification<K>(
         &self,
         hash: ElectrumScriptHash,
@@ -409,32 +703,50 @@ impl BdkElectrumClient {
     where
         K: Ord + Clone + Display,
     {
-        // Check if this script hash belongs to this wallet
-        let has_script: bool = ctx.has_script(&hash).await;
-
-        if !has_script {
+        if !ctx.has_script(&hash).await {
             return None;
         }
 
-        if let Some((keychain, current_index)) = ctx.needs_extension(&hash).await {
-            // Subscribe to new addresses incrementally
-            if let Err(e) = self
-                .subscribe_incremental(keychain, current_index, stop_gap, ctx)
-                .await
-            {
-                tracing::error!("Failed to subscribe incrementally: {}", e);
-            }
-        }
-
-        // Process this script hash update
-        match self
+        let update = match self
             .process_script_hash_update(hash, start_time, fetch_prev_txouts)
             .await
         {
-            Ok(Some(update)) => Some(Ok(update)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
+            Ok(Some(update)) => update,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+
+        if let Err(e) = self
+            .maybe_extend_after_script_update(hash, stop_gap, ctx, &update)
+            .await
+        {
+            return Some(Err(e));
         }
+
+        Some(Ok(update))
+    }
+
+    async fn maybe_extend_after_script_update<K>(
+        &self,
+        hash: ElectrumScriptHash,
+        stop_gap: usize,
+        ctx: &SubscriptionCtx<K>,
+        update: &SyncResponse<ConfirmationBlockTime>,
+    ) -> Result<(), Error>
+    where
+        K: Ord + Clone + Display,
+    {
+        // Do not extend on status churn; extend only for a real script update.
+        if update.tx_update.txs.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((keychain, current_index)) = ctx.extension_target(&hash).await {
+            self.subscribe_incremental(keychain, current_index, stop_gap, ctx)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Subscribe incrementally to new addresses when a transaction is detected on a higher index.
@@ -451,68 +763,103 @@ impl BdkElectrumClient {
     where
         K: Ord + Clone + Display,
     {
-        // Derive scripts to subscribe from new_active_index + 1 to new_active_index + stop_gap
-        let scripts_to_subscribe: Vec<(ElectrumScriptHash, ScriptSubscription, u32)> = {
-            let mut request_guard = ctx.request.lock().await;
-            request_guard
-                .iter_spks(keychain.clone())
-                .skip((new_active_index + 1) as usize)
-                .take(stop_gap)
-                .map(|(index, script)| {
-                    let script_hash = ElectrumScriptHash::new(&script);
-                    let subscription = ScriptSubscription::new(HashSet::new());
-                    (script_hash, subscription, index)
-                })
-                .collect()
+        let (current_max, target_index) = {
+            let max_subscribed = ctx.max_subscribed_indices.lock().await;
+            let current_max = max_subscribed
+                .get(&keychain)
+                .copied()
+                .unwrap_or(new_active_index);
+            (
+                current_max,
+                new_active_index.saturating_add(stop_gap as u32),
+            )
         };
 
-        if scripts_to_subscribe.is_empty() {
+        if current_max >= target_index {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active
+                .entry(keychain)
+                .and_modify(|last| *last = (*last).max(new_active_index))
+                .or_insert(new_active_index);
             return Ok(());
         }
 
-        if let (Some((_, _, start_index)), Some((_, _, end_index))) =
+        let missing = (target_index - current_max) as usize;
+        let scripts_to_subscribe: Vec<(ElectrumScriptHash, u32)> = {
+            let mut request_guard = ctx.request.lock().await;
+            let mut scripts = Vec::with_capacity(missing);
+            for _ in 0..missing {
+                match request_guard.next_spk(keychain.clone()) {
+                    Some((index, script)) => {
+                        let script_hash = ElectrumScriptHash::new(&script);
+                        scripts.push((script_hash, index));
+                    }
+                    None => break,
+                }
+            }
+            scripts
+        };
+
+        if scripts_to_subscribe.is_empty() {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active
+                .entry(keychain)
+                .and_modify(|last| *last = (*last).max(new_active_index))
+                .or_insert(new_active_index);
+            return Ok(());
+        }
+
+        if let (Some((_, start_index)), Some((_, end_index))) =
             (scripts_to_subscribe.first(), scripts_to_subscribe.last())
         {
-            util::log_scan_range(&keychain, *start_index, *end_index);
+            util::log_scan_range(&ctx.wallet_label, &keychain, *start_index, *end_index);
         }
 
         // Collect script hashes for subscription
-        let script_hashes: Vec<ElectrumScriptHash> = scripts_to_subscribe
-            .iter()
-            .map(|(hash, _, _)| *hash)
-            .collect();
+        let script_hashes: Vec<ElectrumScriptHash> =
+            scripts_to_subscribe.iter().map(|(hash, _)| *hash).collect();
 
         // Subscribe via Electrum first (this can fail)
         self.inner
             .batch_script_hash_subscribe(script_hashes.iter().copied())?;
 
-        // Only update state if subscription succeeded
-        // Update last_active_index
         {
             let mut last_active = ctx.last_active_indices.lock().await;
-            last_active.insert(keychain.clone(), new_active_index);
+            last_active
+                .entry(keychain.clone())
+                .and_modify(|last| *last = (*last).max(new_active_index))
+                .or_insert(new_active_index);
         }
 
-        // Update tracker
-        {
-            let mut tracker = self.subscription_tracker.scripts.lock().await;
-            for (hash, subscription, _) in &scripts_to_subscribe {
-                tracker.insert(*hash, subscription.clone());
-            }
-        }
-
-        // Update the stream's subscribed scripts and lookup in a single batch
         {
             let mut scripts = ctx.subscribed_scripts.lock().await;
             let mut lookup = ctx.script_to_keychain_index.lock().await;
 
             scripts.extend(script_hashes);
-            for (hash, _, index) in &scripts_to_subscribe {
+
+            for (hash, index) in &scripts_to_subscribe {
                 lookup.insert(*hash, (keychain.clone(), *index));
             }
         }
 
-        tracing::info!("Finished loading.");
+        {
+            let mut tracker = self.subscription_tracker.lock().await;
+            for (hash, _) in &scripts_to_subscribe {
+                tracker
+                    .entry(*hash)
+                    .or_insert_with(|| ScriptSubscription::new(HashSet::new()));
+            }
+        }
+
+        let new_max_subscribed = scripts_to_subscribe
+            .iter()
+            .map(|(_, index)| *index)
+            .max()
+            .unwrap_or(current_max);
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert(keychain, new_max_subscribed);
+        }
 
         Ok(())
     }
@@ -525,7 +872,7 @@ impl BdkElectrumClient {
         fetch_prev_txouts: bool,
     ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error> {
         // Look up the script from our tracker
-        let tracker = self.subscription_tracker.scripts.lock().await;
+        let tracker = self.subscription_tracker.lock().await;
         let Some(subscription) = tracker.get(&script_hash).cloned() else {
             // Not tracking this script, ignore
             return Ok(None);
@@ -575,7 +922,7 @@ impl BdkElectrumClient {
         }
 
         // Update our tracker with the new expected txids
-        let mut tracker = self.subscription_tracker.scripts.lock().await;
+        let mut tracker = self.subscription_tracker.lock().await;
         if let Some(subscription) = tracker.get_mut(&script_hash) {
             subscription.expected_txids = current_txids;
         }
@@ -592,24 +939,28 @@ impl BdkElectrumClient {
     /// requested spk will be added to `tx_update`. Anchors of the aforementioned transactions are
     /// also included.
     ///
-    /// If `subscribe` is true, also subscribes to scripts with history for real-time updates
-    /// and returns the set of subscribed script hashes.
+    /// All scanned script hashes are subscribed (including lookahead gap scripts) and returned.
     #[allow(clippy::too_many_arguments)]
     async fn populate_with_spks<K>(
         &self,
+        wallet_label: &str,
         start_time: u64,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
         mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
         stop_gap: usize,
         batch_size: usize,
         keychain: &K,
-    ) -> Result<(Option<u32>, HashSet<ElectrumScriptHash>), Error>
+    ) -> Result<SpkScanResult, Error>
     where
         K: Display,
     {
         let mut unused_spk_count = 0_usize;
-        let mut last_active_index = Option::<u32>::None;
-        let mut subscribed_hashes = HashSet::new();
+        let mut result = SpkScanResult {
+            last_active_index: None,
+            subscribed_hashes: HashSet::new(),
+            subscribed_script_to_index: HashMap::new(),
+            max_subscribed_index: None,
+        };
 
         loop {
             let spks = (0..batch_size)
@@ -617,11 +968,11 @@ impl BdkElectrumClient {
                 .collect::<Vec<_>>();
 
             if spks.is_empty() {
-                return Ok((last_active_index, subscribed_hashes));
+                return Ok(result);
             }
 
             if let (Some((start_index, _)), Some((end_index, _))) = (spks.first(), spks.last()) {
-                util::log_scan_range(&keychain, *start_index, *end_index);
+                util::log_scan_range(wallet_label, keychain, *start_index, *end_index);
             }
 
             let spk_histories = self
@@ -629,37 +980,36 @@ impl BdkElectrumClient {
                 .batch_script_get_history(spks.iter().map(|(_, s)| s.spk.as_script()))
                 .await?;
 
-            // Collect scripts to subscribe (if subscribe=true)
-            let mut scripts_to_subscribe: Vec<(ElectrumScriptHash, ScriptSubscription)> =
+            let mut scripts_to_subscribe: Vec<(ElectrumScriptHash, u32, ScriptSubscription)> =
                 Vec::new();
+            let mut should_stop = false;
+            let mut batch_loaded_indexes: BTreeSet<u32> = BTreeSet::new();
 
             for ((spk_index, spk), spk_history) in spks.into_iter().zip(spk_histories) {
+                let spk_history_set: HashSet<Txid> =
+                    spk_history.iter().map(|res| res.txid()).collect();
+                let script_hash = ElectrumScriptHash::new(&spk.spk);
+                scripts_to_subscribe.push((
+                    script_hash,
+                    spk_index,
+                    ScriptSubscription::new(spk_history_set.clone()),
+                ));
+                result.max_subscribed_index = Some(
+                    result
+                        .max_subscribed_index
+                        .map_or(spk_index, |max| max.max(spk_index)),
+                );
+
                 if spk_history.is_empty() {
                     unused_spk_count = unused_spk_count.saturating_add(1);
                     if unused_spk_count >= stop_gap {
-                        // Subscribe to collected scripts before returning
-                        if !scripts_to_subscribe.is_empty() {
-                            self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
-                                .await;
-                        }
-                        return Ok((last_active_index, subscribed_hashes));
+                        should_stop = true;
                     }
                 } else {
-                    last_active_index = Some(spk_index);
+                    result.last_active_index = Some(spk_index);
                     unused_spk_count = 0;
-
-                    // Collect for subscription
-                    let script_hash = ElectrumScriptHash::new(&spk.spk);
-                    let spk_history_set: HashSet<Txid> =
-                        spk_history.iter().map(|res| res.txid()).collect();
-                    let subscription = ScriptSubscription::new(spk_history_set.clone());
-                    scripts_to_subscribe.push((script_hash, subscription));
+                    batch_loaded_indexes.insert(spk_index);
                 }
-
-                let spk_history_set = spk_history
-                    .iter()
-                    .map(|res| res.txid())
-                    .collect::<HashSet<_>>();
 
                 tx_update.evicted_ats.extend(
                     spk.expected_txids
@@ -683,40 +1033,42 @@ impl BdkElectrumClient {
                 }
             }
 
-            // Subscribe to all scripts with history in this batch
+            util::log_loading_indexes(wallet_label, keychain, batch_loaded_indexes);
+
             if !scripts_to_subscribe.is_empty() {
-                self.subscribe_scripts(&scripts_to_subscribe, &mut subscribed_hashes)
-                    .await;
+                self.subscribe_scripts(&scripts_to_subscribe, &mut result.subscribed_hashes)
+                    .await?;
+                for (hash, index, _) in &scripts_to_subscribe {
+                    result.subscribed_script_to_index.insert(*hash, *index);
+                }
+            }
+
+            if should_stop {
+                return Ok(result);
             }
         }
     }
 
     /// Subscribe to a batch of scripts via Electrum and update the subscription tracker.
     ///
-    /// This method updates the internal subscription tracker with the provided scripts,
-    /// adds their hashes to the provided set, and then subscribes to them via Electrum.
-    /// If the Electrum subscription fails, it logs an error but doesn't propagate it.
+    /// This method subscribes via Electrum first and only updates local state after success.
     async fn subscribe_scripts(
         &self,
-        scripts: &[(ElectrumScriptHash, ScriptSubscription)],
+        scripts: &[(ElectrumScriptHash, u32, ScriptSubscription)],
         subscribed_hashes: &mut HashSet<ElectrumScriptHash>,
-    ) {
-        // Update subscription tracker
+    ) -> Result<(), Error> {
+        self.inner
+            .batch_script_hash_subscribe(scripts.iter().map(|(hash, _, _)| *hash))?;
+
         {
-            let mut tracker = self.subscription_tracker.scripts.lock().await;
-            for (hash, subscription) in scripts {
+            let mut tracker = self.subscription_tracker.lock().await;
+            for (hash, _, subscription) in scripts {
                 tracker.insert(*hash, subscription.clone());
                 subscribed_hashes.insert(*hash);
             }
         }
 
-        // Subscribe via Electrum
-        if let Err(e) = self
-            .inner
-            .batch_script_hash_subscribe(scripts.iter().map(|(hash, _)| *hash))
-        {
-            tracing::error!("Failed to subscribe scripts: {}", e);
-        }
+        Ok(())
     }
 
     /// Validate a transaction's merkle proof and add an anchor if confirmed.
@@ -797,6 +1149,7 @@ impl BdkElectrumClient {
 /// Return a [`CheckPoint`] of the latest tip, that connects with `prev_tip`. The latest blocks are
 /// fetched to construct checkpoint updates with the proper [`BlockHash`] in case of re-org.
 async fn fetch_tip_and_latest_blocks(
+    wallet_label: &str,
     client: &ElectrumClient,
     prev_tip: CheckPoint,
 ) -> Result<(CheckPoint, BTreeMap<u32, BlockHash>), Error> {
@@ -815,6 +1168,10 @@ async fn fetch_tip_and_latest_blocks(
     // to construct our checkpoint update.
     let mut new_blocks = {
         let start_height = new_tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
+        tracing::info!(
+            wallet = %wallet_label,
+            "Retrieving block headers.",
+        );
         let hashes = client
             .block_headers(start_height as _, CHAIN_SUFFIX_LENGTH as _)
             .await?
@@ -930,26 +1287,33 @@ fn chain_update(
 
 /// Build a reverse lookup map: script_hash -> (keychain, index)
 ///
-/// This allows us to efficiently determine which keychain a transaction belongs to
+/// This allows us to efficiently determine which keychain a transaction belongs to.
+/// The map is built only for scripts that were actually subscribed.
+#[cfg(test)]
 fn build_reverse_lookup_map<K>(
     request: &mut FullScanRequest<K>,
-    response: &FullScanResponse<K>,
-    stop_gap: usize,
+    subscribed_scripts: &HashSet<ElectrumScriptHash>,
 ) -> HashMap<ElectrumScriptHash, (K, u32)>
 where
     K: Ord + Clone,
 {
     let mut script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)> = HashMap::new();
+    if subscribed_scripts.is_empty() {
+        return script_to_keychain_index;
+    }
+
+    let mut remaining = subscribed_scripts.len();
 
     for keychain in request.keychains() {
         for (index, script) in request.iter_spks(keychain.clone()) {
             let script_hash = ElectrumScriptHash::new(script);
-            script_to_keychain_index.insert(script_hash, (keychain.clone(), index));
-
-            // Only iterate up to last_active_index + stop_gap to avoid billions of iterations
-            if let Some(&last_active) = response.last_active_indices.get(&keychain) {
-                if index > last_active + stop_gap as u32 {
-                    break;
+            if subscribed_scripts.contains(&script_hash)
+                && !script_to_keychain_index.contains_key(&script_hash)
+            {
+                script_to_keychain_index.insert(script_hash, (keychain.clone(), index));
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    return script_to_keychain_index;
                 }
             }
         }
@@ -976,6 +1340,7 @@ mod tests {
     use testenv::TestEnv;
     use tokio::time::{sleep, timeout};
     use tokio_electrum::address::ElectrumServerAddress;
+    use tokio_electrum::builder::ElectrumClientBuilder;
     use tokio_electrum::client::ElectrumClient;
 
     use super::*;
@@ -1016,11 +1381,24 @@ mod tests {
 
     fn ctx_for_request(request: FullScanRequest<String>) -> SubscriptionCtx<String> {
         SubscriptionCtx {
+            wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
+            max_subscribed_indices: Mutex::new(BTreeMap::new()),
             chain_tip: Mutex::new(None),
+        }
+    }
+
+    async fn advance_request_cursor(
+        ctx: &SubscriptionCtx<String>,
+        keychain: &str,
+        consumed: usize,
+    ) {
+        let mut request = ctx.request.lock().await;
+        for _ in 0..consumed {
+            let _ = request.next_spk(keychain.to_string());
         }
     }
 
@@ -1096,10 +1474,12 @@ mod tests {
     async fn handle_block_header_notification_returns_none_without_tip() {
         let request = FullScanRequest::<String>::builder_at(0).build();
         let ctx = SubscriptionCtx {
+            wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
+            max_subscribed_indices: Mutex::new(BTreeMap::new()),
             chain_tip: Mutex::new(None),
         };
         let header = genesis_block(Network::Regtest).header;
@@ -1113,10 +1493,12 @@ mod tests {
         let genesis = genesis_block(Network::Regtest);
         let request = FullScanRequest::<String>::builder_at(0).build();
         let ctx = SubscriptionCtx {
+            wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
+            max_subscribed_indices: Mutex::new(BTreeMap::new()),
             chain_tip: Mutex::new(Some(CheckPoint::new(BlockId {
                 height: 0,
                 hash: genesis.block_hash(),
@@ -1132,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn build_reverse_lookup_map_respects_last_active_plus_stop_gap() {
+    fn build_reverse_lookup_map_tracks_only_subscribed_hashes() {
         let mut request = FullScanRequest::<String>::builder_at(0)
             .spks_for_keychain(
                 "external".to_string(),
@@ -1145,18 +1527,20 @@ mod tests {
                 ],
             )
             .build();
-        let response = FullScanResponse {
-            tx_update: TxUpdate::default(),
-            chain_update: None,
-            last_active_indices: BTreeMap::from([("external".to_string(), 1)]),
-        };
+        let tracked = HashSet::from([
+            ElectrumScriptHash::new(&script(0x52)),
+            ElectrumScriptHash::new(&script(0x54)),
+        ]);
 
-        let lookup = build_reverse_lookup_map(&mut request, &response, 1);
-        let max_index = lookup.values().map(|(_, index)| *index).max().unwrap();
-        assert_eq!(max_index, 3);
-        assert!(
-            !lookup.values().any(|(_, index)| *index == 4),
-            "lookup should stop after the first index greater than last_active + stop_gap"
+        let lookup = build_reverse_lookup_map(&mut request, &tracked);
+        assert_eq!(lookup.len(), tracked.len());
+        assert_eq!(
+            lookup.get(&ElectrumScriptHash::new(&script(0x52))),
+            Some(&("external".to_string(), 1))
+        );
+        assert_eq!(
+            lookup.get(&ElectrumScriptHash::new(&script(0x54))),
+            Some(&("external".to_string(), 3))
         );
     }
 
@@ -1225,9 +1609,9 @@ mod tests {
             ctx.keychain_index(&hash1).await,
             Some(("external".to_string(), 1))
         );
-        assert_eq!(ctx.needs_extension(&hash1).await, None);
+        assert_eq!(ctx.extension_target(&hash1).await, None);
         assert_eq!(
-            ctx.needs_extension(&hash3).await,
+            ctx.extension_target(&hash3).await,
             Some(("external".to_string(), 3))
         );
     }
@@ -1247,6 +1631,11 @@ mod tests {
             )
             .build();
         let ctx = ctx_for_request(request);
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 0);
+        }
+        advance_request_cursor(&ctx, "external", 1).await;
 
         client
             .subscribe_incremental("external".to_string(), 0, 2, &ctx)
@@ -1288,6 +1677,11 @@ mod tests {
             )
             .build();
         let ctx = ctx_for_request(request);
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 1);
+        }
+        advance_request_cursor(&ctx, "external", 2).await;
 
         client
             .subscribe_incremental("external".to_string(), 10, 3, &ctx)
@@ -1311,7 +1705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_script_hash_notification_can_extend_without_update() {
+    async fn handle_script_hash_notification_does_not_extend_without_update() {
         let client = test_bdk_client();
         let request = FullScanRequest::<String>::builder_at(0)
             .spks_for_keychain(
@@ -1340,6 +1734,11 @@ mod tests {
             let mut last_active = ctx.last_active_indices.lock().await;
             last_active.insert("external".to_string(), 1);
         }
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 2);
+        }
+        advance_request_cursor(&ctx, "external", 3).await;
 
         let update = client
             .handle_script_hash_notification(trigger_hash, 0, false, 2, &ctx)
@@ -1350,12 +1749,143 @@ mod tests {
         );
 
         let last_active = ctx.last_active_indices.lock().await;
+        assert_eq!(last_active.get("external"), Some(&1));
+        drop(last_active);
+
+        let scripts = ctx.subscribed_scripts.lock().await;
+        assert!(
+            !scripts.contains(&ElectrumScriptHash::new(&script(0x54))),
+            "stop-gap must not extend on unchanged script status"
+        );
+        assert!(
+            !scripts.contains(&ElectrumScriptHash::new(&script(0x55))),
+            "stop-gap must not extend on unchanged script status"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_extend_after_script_update_extends_when_update_has_txs() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x61)),
+                    (1, script(0x62)),
+                    (2, script(0x63)),
+                    (3, script(0x64)),
+                    (4, script(0x65)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+        let trigger_hash = ElectrumScriptHash::new(&script(0x63));
+
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            scripts.insert(trigger_hash);
+        }
+        {
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+            lookup.insert(trigger_hash, ("external".to_string(), 2));
+        }
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert("external".to_string(), 1);
+        }
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 2);
+        }
+        advance_request_cursor(&ctx, "external", 3).await;
+
+        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+        tx_update.txs.push(Arc::new(dummy_tx(0xAA)));
+        let update = SyncResponse {
+            tx_update,
+            chain_update: None,
+        };
+
+        client
+            .maybe_extend_after_script_update(trigger_hash, 2, &ctx, &update)
+            .await
+            .unwrap();
+
+        let last_active = ctx.last_active_indices.lock().await;
         assert_eq!(last_active.get("external"), Some(&2));
         drop(last_active);
 
         let scripts = ctx.subscribed_scripts.lock().await;
-        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x54))));
-        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x55))));
+        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x64))));
+        assert!(scripts.contains(&ElectrumScriptHash::new(&script(0x65))));
+    }
+
+    #[tokio::test]
+    async fn maybe_extend_after_script_update_does_not_extend_without_txs() {
+        let client = test_bdk_client();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x71)),
+                    (1, script(0x72)),
+                    (2, script(0x73)),
+                    (3, script(0x74)),
+                    (4, script(0x75)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+        let trigger_hash = ElectrumScriptHash::new(&script(0x73));
+
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            scripts.insert(trigger_hash);
+        }
+        {
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+            lookup.insert(trigger_hash, ("external".to_string(), 2));
+        }
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert("external".to_string(), 1);
+        }
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 2);
+        }
+        advance_request_cursor(&ctx, "external", 3).await;
+
+        let update = SyncResponse {
+            tx_update: TxUpdate::<ConfirmationBlockTime>::default(),
+            chain_update: Some(CheckPoint::new(BlockId {
+                height: 1,
+                hash: hash("0000000000000000000000000000000000000000000000000000000000000001"),
+            })),
+        };
+
+        client
+            .maybe_extend_after_script_update(trigger_hash, 2, &ctx, &update)
+            .await
+            .unwrap();
+
+        let last_active = ctx.last_active_indices.lock().await;
+        assert_eq!(
+            last_active.get("external"),
+            Some(&1),
+            "last active index should remain unchanged when no txs were added"
+        );
+        drop(last_active);
+
+        let scripts = ctx.subscribed_scripts.lock().await;
+        assert!(
+            !scripts.contains(&ElectrumScriptHash::new(&script(0x74))),
+            "stop-gap must not extend when tx_update.txs is empty"
+        );
+        assert!(
+            !scripts.contains(&ElectrumScriptHash::new(&script(0x75))),
+            "stop-gap must not extend when tx_update.txs is empty"
+        );
     }
 
     #[tokio::test]
@@ -1409,7 +1939,7 @@ mod tests {
             height: 1_000,
             hash: hash("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
         });
-        let (tip, latest) = fetch_tip_and_latest_blocks(&client, prev_tip.clone())
+        let (tip, latest) = fetch_tip_and_latest_blocks("test-wallet", &client, prev_tip.clone())
             .await
             .unwrap();
 
@@ -1440,7 +1970,7 @@ mod tests {
             hash: hash("abababababababababababababababababababababababababababababababab"),
         });
 
-        let (tip, latest) = fetch_tip_and_latest_blocks(&client, wrong_prev_tip)
+        let (tip, latest) = fetch_tip_and_latest_blocks("test-wallet", &client, wrong_prev_tip)
             .await
             .unwrap();
 
@@ -1456,6 +1986,21 @@ mod tests {
         let addr =
             ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
         let inner = ElectrumClient::new(addr);
+        let client = BdkElectrumClient::new(inner);
+        client.connect();
+        wait_connected(&client).await;
+        client
+    }
+
+    async fn connected_bdk_client_with_notification_channel(
+        env: &TestEnv,
+        notification_channel_size: usize,
+    ) -> BdkElectrumClient {
+        let addr =
+            ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
+        let inner = ElectrumClientBuilder::new(addr)
+            .notification_channel_size(notification_channel_size)
+            .build();
         let client = BdkElectrumClient::new(inner);
         client.connect();
         wait_connected(&client).await;
@@ -1504,7 +2049,7 @@ mod tests {
             )
             .build();
 
-        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
         let first = stream
             .next()
             .await
@@ -1514,6 +2059,74 @@ mod tests {
             SubscribeEvent::Initial(initial) => assert!(initial.is_empty()),
             other => panic!("expected initial event first, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_stream_catches_first_tx_for_address_without_history_at_start() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let unused_0 = env.bitcoind.client.new_address().unwrap();
+        let unused_1 = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, unused_0.script_pubkey()), (1, unused_1.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request).fetch_prev_txouts(true).await.unwrap();
+        let first = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+        match first {
+            SubscribeEvent::Initial(initial) => {
+                assert!(
+                    initial.tx_update.txs.is_empty(),
+                    "both scripts start unused in this test"
+                );
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+
+        let new_txid = env
+            .bitcoind
+            .client
+            .send_to_address(&unused_1, Amount::from_sat(25_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&new_txid);
+
+        let saw_tx_update = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == new_txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_tx_update,
+            "expected first tx to previously-unused scanned script to be streamed"
+        );
     }
 
     #[tokio::test]
@@ -1530,7 +2143,7 @@ mod tests {
             )
             .build();
 
-        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
         let first = stream
             .next()
             .await
@@ -1567,7 +2180,7 @@ mod tests {
             )
             .build();
 
-        let mut stream = client.sync(request, 20, 20, true).await.unwrap();
+        let mut stream = client.sync(request).fetch_prev_txouts(true).await.unwrap();
         let first = stream
             .next()
             .await
@@ -1603,7 +2216,7 @@ mod tests {
             )
             .build();
 
-        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
         let _ = stream
             .next()
             .await
@@ -1655,7 +2268,7 @@ mod tests {
                 vec![(0, tracked_address.script_pubkey())],
             )
             .build();
-        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
 
         let _ = timeout(Duration::from_secs(10), stream.next())
             .await
@@ -1695,7 +2308,7 @@ mod tests {
                 vec![(0, tracked_address.script_pubkey())],
             )
             .build();
-        let mut stream = client.sync(request, 20, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
         let _ = stream
             .next()
             .await
@@ -1743,7 +2356,7 @@ mod tests {
             )
             .build();
 
-        let mut stream = client.sync(request, 20, 20, true).await.unwrap();
+        let mut stream = client.sync(request).fetch_prev_txouts(true).await.unwrap();
         let _ = stream
             .next()
             .await
@@ -1785,5 +2398,395 @@ mod tests {
             saw_tx_update,
             "expected script-hash update with transaction and prevouts"
         );
+    }
+
+    #[tokio::test]
+    async fn subscribe_scripts_does_not_mutate_state_on_subscription_failure() {
+        let client = test_bdk_client();
+        let mut subscribed_hashes = HashSet::new();
+        let hash = ElectrumScriptHash::new(&script(0x71));
+        let scripts = vec![(hash, 0, ScriptSubscription::new(HashSet::new()))];
+
+        let mut saturated = false;
+        for i in 0..10_000_u32 {
+            let queued_hash = ElectrumScriptHash::new(&script((i % 251) as u8));
+            if client.script_hash_subscribe(queued_hash).is_err() {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(
+            saturated,
+            "expected command queue saturation to force subscribe failure"
+        );
+
+        assert!(
+            client
+                .subscribe_scripts(&scripts, &mut subscribed_hashes)
+                .await
+                .is_err()
+        );
+        assert!(
+            subscribed_hashes.is_empty(),
+            "local subscribed hash set must remain unchanged on failure"
+        );
+        assert!(
+            client.subscription_tracker.lock().await.is_empty(),
+            "tracker must remain unchanged on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_batches_multiple_script_updates_into_single_event() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let addr_a = env.bitcoind.client.new_address().unwrap();
+        let addr_b = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, addr_a.script_pubkey()), (1, addr_b.script_pubkey())],
+            )
+            .build();
+        let mut stream = client
+            .sync(request)
+            .batch_window(Duration::from_secs(4))
+            .await
+            .unwrap();
+
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid_a = env
+            .bitcoind
+            .client
+            .send_to_address(&addr_a, Amount::from_sat(11_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        let txid_b = env
+            .bitcoind
+            .client
+            .send_to_address(&addr_b, Amount::from_sat(12_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid_a);
+        env.electrsd.wait_tx(&txid_b);
+
+        let combined = timeout(Duration::from_secs(40), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update)) => {
+                        let txids = update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .map(|tx| tx.compute_txid())
+                            .collect::<HashSet<_>>();
+                        if txids.contains(&txid_a) || txids.contains(&txid_b) {
+                            return txids.contains(&txid_a) && txids.contains(&txid_b);
+                        }
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(SubscribeEvent::Initial(_)) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            combined,
+            "expected a single batched tx update containing both transactions"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_batches_script_and_header_into_single_event() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client
+            .sync(request)
+            .fetch_prev_txouts(true)
+            .batch_window(Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(30_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+        let new_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(new_height);
+
+        let mixed_update = timeout(Duration::from_secs(45), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update)) => {
+                        let has_tx = update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid);
+                        if has_tx {
+                            return update.chain_update.is_some();
+                        }
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(SubscribeEvent::Initial(_)) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            mixed_update,
+            "expected script tx and chain tip update to be coalesced in one batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_lag_recovery_catches_up_tracked_scripts() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client_with_notification_channel(&env, 4).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client
+            .sync(request)
+            .batch_window(Duration::from_millis(300))
+            .await
+            .unwrap();
+
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(22_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.bitcoind
+            .client
+            .generate_to_address(12, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+        let new_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(new_height);
+
+        let caught_up = timeout(Duration::from_secs(45), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Update(_)) => {}
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(SubscribeEvent::Initial(_)) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            caught_up,
+            "expected lagged receiver to recover and include tracked tx via catch-up scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_emits_pending_batch_before_disconnected() {
+        let env = TestEnv::new();
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client
+            .sync(request)
+            .batch_window(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+        let mut probe_notifications = client.notifications();
+
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let new_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(new_height);
+        let saw_header_notification = timeout(Duration::from_secs(20), async {
+            loop {
+                match probe_notifications.recv().await {
+                    Ok(ElectrumNotification::BlockHeader { .. }) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_header_notification,
+            "expected to observe header notification before disconnect"
+        );
+        sleep(Duration::from_millis(100)).await;
+
+        client.disconnect();
+
+        let first = timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for first post-disconnect event")
+            .expect("stream ended before first post-disconnect event")
+            .expect("first post-disconnect event should not error");
+        let second = timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for second post-disconnect event")
+            .expect("stream ended before second post-disconnect event")
+            .expect("second post-disconnect event should not error");
+
+        assert!(
+            matches!(first, SubscribeEvent::Update(ref u) if u.chain_update.is_some()),
+            "expected pending chain update before disconnect marker"
+        );
+        assert!(
+            matches!(second, SubscribeEvent::Disconnected),
+            "expected disconnected marker after pending update"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_incremental_maintains_contiguous_stop_gap_window() {
+        let client = test_bdk_client();
+
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![
+                    (0, script(0x81)),
+                    (1, script(0x82)),
+                    (2, script(0x83)),
+                    (3, script(0x84)),
+                    (4, script(0x85)),
+                    (5, script(0x86)),
+                    (6, script(0x87)),
+                    (7, script(0x88)),
+                ],
+            )
+            .build();
+        let ctx = ctx_for_request(request);
+
+        {
+            let mut scripts = ctx.subscribed_scripts.lock().await;
+            let mut lookup = ctx.script_to_keychain_index.lock().await;
+            let mut tracker = client.subscription_tracker.lock().await;
+            for (index, tag) in [(0_u32, 0x81_u8), (1, 0x82), (2, 0x83)] {
+                let hash = ElectrumScriptHash::new(&script(tag));
+                scripts.insert(hash);
+                lookup.insert(hash, ("external".to_string(), index));
+                tracker.insert(hash, ScriptSubscription::new(HashSet::new()));
+            }
+        }
+        {
+            let mut last_active = ctx.last_active_indices.lock().await;
+            last_active.insert("external".to_string(), 0);
+        }
+        {
+            let mut max_subscribed = ctx.max_subscribed_indices.lock().await;
+            max_subscribed.insert("external".to_string(), 2);
+        }
+        advance_request_cursor(&ctx, "external", 3).await;
+
+        client
+            .subscribe_incremental("external".to_string(), 3, 2, &ctx)
+            .await
+            .unwrap();
+        client
+            .subscribe_incremental("external".to_string(), 5, 2, &ctx)
+            .await
+            .unwrap();
+
+        let lookup = ctx.script_to_keychain_index.lock().await;
+        let mut seen = lookup
+            .values()
+            .filter_map(|(k, i)| (k == "external").then_some(*i))
+            .collect::<Vec<_>>();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "subscribed index coverage should stay contiguous with no holes"
+        );
+        drop(lookup);
+
+        let max_subscribed = ctx.max_subscribed_indices.lock().await;
+        assert_eq!(max_subscribed.get("external"), Some(&7));
     }
 }

@@ -37,17 +37,17 @@ async fn main() {
 
         // Unified subscribe stream: initial scan + real-time updates
         let request = wallet.start_full_scan().build();
-        let mut stream = client.sync(request, 50, 20, false).await.unwrap();
+        let mut stream = client.sync(request).await.unwrap();
 
         // Listen for initial and real-time updates
         while let Some(event) = stream.next().await {
             match event {
                 Ok(SubscribeEvent::Initial(initial)) => {
-                    println!("Initial full scan completed");
+                    println!("Initial full scan completed.");
                     wallet.apply_update(initial).unwrap();
                 }
                 Ok(SubscribeEvent::Update(update)) => {
-                    println!("Received update: {:?}", update);
+                    println!("Received update.");
                     wallet.apply_update(update).unwrap();
                 }
                 Ok(SubscribeEvent::Disconnected) => {

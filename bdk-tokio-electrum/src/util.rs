@@ -1,4 +1,5 @@
-use std::fmt::Display;
+use std::collections::BTreeSet;
+use std::fmt::{Display, Write};
 
 use bdk_core::bitcoin::Txid;
 use bdk_core::bitcoin::hash_types::TxMerkleNode;
@@ -40,9 +41,94 @@ pub(crate) fn validate_merkle_proof(
 }
 
 #[inline]
-pub(crate) fn log_scan_range<K>(keychain: &K, start_index: u32, end_index: u32)
+pub(crate) fn log_scan_range<K>(wallet_label: &str, keychain: &K, start_index: u32, end_index: u32)
 where
     K: Display,
 {
-    tracing::info!("Finding transactions for `{keychain}` keychain [{start_index}-{end_index}]",);
+    let mut range = String::new();
+
+    push_range(&mut range, start_index, end_index);
+
+    tracing::info!(
+        wallet = %wallet_label,
+        keychain = %keychain,
+        "Finding transactions [{range}]"
+    );
+}
+
+pub(crate) fn log_loading_indexes<K>(wallet_label: &str, keychain: &K, indexes: BTreeSet<u32>)
+where
+    K: Display,
+{
+    if let Some(ranges) = format_index_ranges(indexes) {
+        tracing::info!(
+            wallet = %wallet_label,
+            keychain = %keychain,
+            "Loading transactions [{ranges}]"
+        );
+    }
+}
+
+fn format_index_ranges(indexes: BTreeSet<u32>) -> Option<String> {
+    if indexes.is_empty() {
+        return None;
+    }
+
+    let mut ranges = String::new();
+    let mut start = indexes.first().copied()?;
+    let mut end = start;
+
+    for index in indexes.iter().copied().skip(1) {
+        if index == end.saturating_add(1) {
+            end = index;
+            continue;
+        }
+
+        push_range(&mut ranges, start, end);
+        start = index;
+        end = index;
+    }
+    push_range(&mut ranges, start, end);
+
+    Some(ranges)
+}
+
+fn push_range(output: &mut String, start: u32, end: u32) {
+    if !output.is_empty() {
+        output.push_str(", ");
+    }
+
+    if start == end {
+        let _ = write!(output, "{start}");
+    } else {
+        let _ = write!(output, "{start}-{end}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::format_index_ranges;
+
+    #[test]
+    fn format_index_ranges_returns_none_for_empty_input() {
+        let indexes = BTreeSet::new();
+        assert_eq!(format_index_ranges(indexes), None);
+    }
+
+    #[test]
+    fn format_index_ranges_dedups_sorts_and_compacts() {
+        let indexes = BTreeSet::from([11, 10, 8, 7, 5, 4, 4, 12]);
+        assert_eq!(
+            format_index_ranges(indexes),
+            Some("4-5, 7-8, 10-12".to_string())
+        );
+    }
+
+    #[test]
+    fn format_index_ranges_handles_singletons() {
+        let indexes = BTreeSet::from([9, 2, 14]);
+        assert_eq!(format_index_ranges(indexes), Some("2, 9, 14".to_string()));
+    }
 }
