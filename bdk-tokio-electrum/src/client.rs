@@ -639,7 +639,7 @@ impl BdkElectrumClient {
                 Some(Ok(update)) => {
                     chain_update = update.chain_update;
                 }
-                Some(Err(Error::Disconnected)) => {
+                Some(Err(e)) if e.is_disconnected_like() => {
                     batch.disconnected = true;
                 }
                 Some(Err(e)) => return Err(e),
@@ -662,7 +662,7 @@ impl BdkElectrumClient {
                 Some(Ok(update)) => {
                     tx_update.extend(update.tx_update);
                 }
-                Some(Err(Error::Disconnected)) => {
+                Some(Err(e)) if e.is_disconnected_like() => {
                     batch.disconnected = true;
                     break;
                 }

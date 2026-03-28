@@ -92,6 +92,17 @@ pub enum Error {
     TerminationRequest,
 }
 
+impl Error {
+    /// Returns true when the error indicates the client is no longer connected.
+    #[inline]
+    pub fn is_disconnected_like(&self) -> bool {
+        matches!(
+            self,
+            Self::Disconnected | Self::BatchRequest(BatchRequestError::Canceled)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Config {
     connection_mode: ElectrumConnectionMode,
