@@ -30,6 +30,7 @@ struct SubscriptionCtx<K> {
     wallet_label: String,
     request: Mutex<FullScanRequest<K>>,
     subscribed_scripts: Mutex<HashSet<ElectrumScriptHash>>,
+    script_subscriptions: Mutex<HashMap<ElectrumScriptHash, ScriptSubscription>>,
     script_to_keychain_index: Mutex<HashMap<ElectrumScriptHash, (K, u32)>>,
     last_active_indices: Mutex<BTreeMap<K, u32>>,
     max_subscribed_indices: Mutex<BTreeMap<K, u32>>,
@@ -86,6 +87,7 @@ impl PendingBatch {
 
 struct SubscriptionInit<K> {
     subscribed_scripts: HashSet<ElectrumScriptHash>,
+    script_subscriptions: HashMap<ElectrumScriptHash, ScriptSubscription>,
     script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)>,
     max_subscribed_indices: BTreeMap<K, u32>,
 }
@@ -93,6 +95,7 @@ struct SubscriptionInit<K> {
 struct SpkScanResult {
     last_active_index: Option<u32>,
     subscribed_hashes: HashSet<ElectrumScriptHash>,
+    subscribed_script_subscriptions: HashMap<ElectrumScriptHash, ScriptSubscription>,
     subscribed_script_to_index: HashMap<ElectrumScriptHash, u32>,
     max_subscribed_index: Option<u32>,
 }
@@ -241,8 +244,6 @@ pub struct BdkElectrumClient {
     tx_cache: Arc<RwLock<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
     block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
-    /// Maps script hash to subscription information
-    subscription_tracker: Arc<Mutex<HashMap<ElectrumScriptHash, ScriptSubscription>>>,
 }
 
 impl Deref for BdkElectrumClient {
@@ -260,7 +261,6 @@ impl BdkElectrumClient {
             inner: client,
             tx_cache: Default::default(),
             block_header_cache: Default::default(),
-            subscription_tracker: Default::default(),
         }
     }
 
@@ -350,6 +350,8 @@ impl BdkElectrumClient {
         let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
         let mut last_active_indices: BTreeMap<K, u32> = BTreeMap::default();
         let mut all_subscribed_scripts: HashSet<ElectrumScriptHash> = HashSet::new();
+        let mut all_script_subscriptions: HashMap<ElectrumScriptHash, ScriptSubscription> =
+            HashMap::new();
         let mut all_script_to_keychain_index: HashMap<ElectrumScriptHash, (K, u32)> =
             HashMap::new();
         let mut max_subscribed_indices: BTreeMap<K, u32> = BTreeMap::new();
@@ -377,6 +379,7 @@ impl BdkElectrumClient {
 
             // Collect all subscribed script hashes
             all_subscribed_scripts.extend(spk_scan.subscribed_hashes);
+            all_script_subscriptions.extend(spk_scan.subscribed_script_subscriptions);
 
             for (hash, index) in spk_scan.subscribed_script_to_index {
                 all_script_to_keychain_index.insert(hash, (keychain.clone(), index));
@@ -412,6 +415,7 @@ impl BdkElectrumClient {
             response,
             SubscriptionInit {
                 subscribed_scripts: all_subscribed_scripts,
+                script_subscriptions: all_script_subscriptions,
                 script_to_keychain_index: all_script_to_keychain_index,
                 max_subscribed_indices,
             },
@@ -497,6 +501,7 @@ impl BdkElectrumClient {
             wallet_label,
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(subscription_init.subscribed_scripts),
+            script_subscriptions: Mutex::new(subscription_init.script_subscriptions),
             script_to_keychain_index: Mutex::new(subscription_init.script_to_keychain_index),
             last_active_indices: Mutex::new(response.last_active_indices.clone()),
             max_subscribed_indices: Mutex::new(subscription_init.max_subscribed_indices),
@@ -712,7 +717,7 @@ impl BdkElectrumClient {
         }
 
         let update = match self
-            .process_script_hash_update(hash, start_time, fetch_prev_txouts)
+            .process_script_hash_update(hash, start_time, fetch_prev_txouts, ctx)
             .await
         {
             Ok(Some(update)) => update,
@@ -847,9 +852,9 @@ impl BdkElectrumClient {
         }
 
         {
-            let mut tracker = self.subscription_tracker.lock().await;
+            let mut subscriptions = ctx.script_subscriptions.lock().await;
             for (hash, _) in &scripts_to_subscribe {
-                tracker
+                subscriptions
                     .entry(*hash)
                     .or_insert_with(|| ScriptSubscription::new(HashMap::new()));
             }
@@ -869,19 +874,23 @@ impl BdkElectrumClient {
     }
 
     /// Process a script hash notification and return a TxUpdate if there are changes
-    async fn process_script_hash_update(
+    async fn process_script_hash_update<K>(
         &self,
         script_hash: ElectrumScriptHash,
         start_time: u64,
         fetch_prev_txouts: bool,
-    ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error> {
+        ctx: &SubscriptionCtx<K>,
+    ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error>
+    where
+        K: Ord + Clone,
+    {
         // Look up the script from our tracker
-        let tracker = self.subscription_tracker.lock().await;
-        let Some(subscription) = tracker.get(&script_hash).cloned() else {
+        let subscriptions = ctx.script_subscriptions.lock().await;
+        let Some(subscription) = subscriptions.get(&script_hash).cloned() else {
             // Not tracking this script, ignore
             return Ok(None);
         };
-        drop(tracker);
+        drop(subscriptions);
 
         let expected_tx_heights: HashMap<Txid, i64> = subscription.expected_tx_heights;
 
@@ -940,8 +949,8 @@ impl BdkElectrumClient {
         }
 
         // Update our tracker with the new expected txids
-        let mut tracker = self.subscription_tracker.lock().await;
-        if let Some(subscription) = tracker.get_mut(&script_hash) {
+        let mut subscriptions = ctx.script_subscriptions.lock().await;
+        if let Some(subscription) = subscriptions.get_mut(&script_hash) {
             subscription.expected_tx_heights = current_tx_heights;
         }
 
@@ -976,6 +985,7 @@ impl BdkElectrumClient {
         let mut result = SpkScanResult {
             last_active_index: None,
             subscribed_hashes: HashSet::new(),
+            subscribed_script_subscriptions: HashMap::new(),
             subscribed_script_to_index: HashMap::new(),
             max_subscribed_index: None,
         };
@@ -1058,8 +1068,12 @@ impl BdkElectrumClient {
             util::log_loading_indexes(wallet_label, keychain, batch_loaded_indexes);
 
             if !scripts_to_subscribe.is_empty() {
-                self.subscribe_scripts(&scripts_to_subscribe, &mut result.subscribed_hashes)
-                    .await?;
+                self.subscribe_scripts(
+                    &scripts_to_subscribe,
+                    &mut result.subscribed_hashes,
+                    &mut result.subscribed_script_subscriptions,
+                )
+                .await?;
                 for (hash, index, _) in &scripts_to_subscribe {
                     result.subscribed_script_to_index.insert(*hash, *index);
                 }
@@ -1078,16 +1092,14 @@ impl BdkElectrumClient {
         &self,
         scripts: &[(ElectrumScriptHash, u32, ScriptSubscription)],
         subscribed_hashes: &mut HashSet<ElectrumScriptHash>,
+        script_subscriptions: &mut HashMap<ElectrumScriptHash, ScriptSubscription>,
     ) -> Result<(), Error> {
         self.inner
             .batch_script_hash_subscribe(scripts.iter().map(|(hash, _, _)| *hash))?;
 
-        {
-            let mut tracker = self.subscription_tracker.lock().await;
-            for (hash, _, subscription) in scripts {
-                tracker.insert(*hash, subscription.clone());
-                subscribed_hashes.insert(*hash);
-            }
+        for (hash, _, subscription) in scripts {
+            script_subscriptions.insert(*hash, subscription.clone());
+            subscribed_hashes.insert(*hash);
         }
 
         Ok(())
@@ -1406,6 +1418,7 @@ mod tests {
             wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
+            script_subscriptions: Mutex::new(HashMap::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
             max_subscribed_indices: Mutex::new(BTreeMap::new()),
@@ -1499,6 +1512,7 @@ mod tests {
             wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
+            script_subscriptions: Mutex::new(HashMap::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
             max_subscribed_indices: Mutex::new(BTreeMap::new()),
@@ -1518,6 +1532,7 @@ mod tests {
             wallet_label: String::from("test-wallet"),
             request: Mutex::new(request),
             subscribed_scripts: Mutex::new(HashSet::new()),
+            script_subscriptions: Mutex::new(HashMap::new()),
             script_to_keychain_index: Mutex::new(HashMap::new()),
             last_active_indices: Mutex::new(BTreeMap::new()),
             max_subscribed_indices: Mutex::new(BTreeMap::new()),
@@ -1914,9 +1929,10 @@ mod tests {
     async fn process_script_hash_update_ignores_untracked_hash() {
         let client = test_bdk_client();
         let hash = ElectrumScriptHash::new(&script(0x61));
+        let ctx = ctx_for_request(FullScanRequest::<String>::builder_at(0).build());
 
         let update = client
-            .process_script_hash_update(hash, 0, false)
+            .process_script_hash_update(hash, 0, false, &ctx)
             .await
             .unwrap();
         assert!(update.is_none());
@@ -2363,6 +2379,453 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_streams_isolate_non_overlapping_wallet_scripts() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let wallet_a_address = env.bitcoind.client.new_address().unwrap();
+        let wallet_b_address = env.bitcoind.client.new_address().unwrap();
+
+        let request_a = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "wallet-a".to_string(),
+                vec![(0, wallet_a_address.script_pubkey())],
+            )
+            .build();
+        let request_b = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "wallet-b".to_string(),
+                vec![(0, wallet_b_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream_a = client.sync(request_a).await.unwrap();
+        let mut stream_b = client.sync(request_b).await.unwrap();
+
+        let _ = stream_a
+            .next()
+            .await
+            .expect("expected initial event for wallet A")
+            .expect("initial event for wallet A should not error");
+        let _ = stream_b
+            .next()
+            .await
+            .expect("expected initial event for wallet B")
+            .expect("initial event for wallet B should not error");
+
+        let txid_a = env
+            .bitcoind
+            .client
+            .send_to_address(&wallet_a_address, Amount::from_sat(30_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid_a);
+
+        let wallet_a_saw_its_tx = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream_a.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid_a) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            wallet_a_saw_its_tx,
+            "wallet A should receive update for wallet A script"
+        );
+
+        let wallet_b_saw_wallet_a_tx = timeout(Duration::from_secs(3), async {
+            while let Some(event) = stream_b.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid_a) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            !wallet_b_saw_wallet_a_tx,
+            "wallet B must not receive wallet A transaction updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_streams_with_overlapping_scripts_both_receive_tx_update() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let shared_address = env.bitcoind.client.new_address().unwrap();
+
+        let request_a = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "wallet-a".to_string(),
+                vec![(0, shared_address.script_pubkey())],
+            )
+            .build();
+        let request_b = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "wallet-b".to_string(),
+                vec![(0, shared_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream_a = client.sync(request_a).await.unwrap();
+        let mut stream_b = client.sync(request_b).await.unwrap();
+
+        let _ = stream_a
+            .next()
+            .await
+            .expect("expected initial event for wallet A")
+            .expect("initial event for wallet A should not error");
+        let _ = stream_b
+            .next()
+            .await
+            .expect("expected initial event for wallet B")
+            .expect("initial event for wallet B should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&shared_address, Amount::from_sat(31_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let wallet_a_saw = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream_a.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            wallet_a_saw,
+            "wallet A should receive update for shared script"
+        );
+
+        let wallet_b_saw = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream_b.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            wallet_b_saw,
+            "wallet B should receive update for shared script"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_handles_reorg_confirmed_pending_reconfirmed() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(32_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_pending = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .seen_ats
+                            .iter()
+                            .any(|(seen_txid, _)| *seen_txid == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_pending,
+            "expected pending update before first confirmation"
+        );
+
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let first_confirmed_height =
+            env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(first_confirmed_height);
+
+        let first_anchor = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update)) => {
+                        if let Some((anchor, _)) = update
+                            .tx_update
+                            .anchors
+                            .iter()
+                            .find(|(_, anchor_txid)| *anchor_txid == txid)
+                        {
+                            return Some(anchor.block_id);
+                        }
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return None,
+                    Err(_) => return None,
+                    Ok(_) => {}
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or(None)
+        .expect("expected first confirmation anchor");
+
+        env.bitcoind
+            .client
+            .invalidate_block(first_anchor.hash)
+            .expect("failed to invalidate tip block for reorg simulation");
+        let reorg_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(reorg_height);
+
+        let saw_reorg_pending = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .seen_ats
+                            .iter()
+                            .any(|(seen_txid, _)| *seen_txid == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_reorg_pending,
+            "expected pending update after reorg invalidates prior confirmation"
+        );
+
+        env.bitcoind
+            .client
+            .generate_to_address(2, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let reconfirmed_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(reconfirmed_height);
+
+        let second_anchor = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update)) => {
+                        if let Some((anchor, _)) = update
+                            .tx_update
+                            .anchors
+                            .iter()
+                            .find(|(_, anchor_txid)| *anchor_txid == txid)
+                        {
+                            return Some(anchor.block_id);
+                        }
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return None,
+                    Err(_) => return None,
+                    Ok(_) => {}
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or(None)
+        .expect("expected second confirmation anchor");
+
+        assert_ne!(
+            first_anchor.hash, second_anchor.hash,
+            "expected reconfirmed anchor to point at a different block hash after reorg"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_reconnect_picks_up_confirmation_transition() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+
+        let mut stream = client.sync(request).await.unwrap();
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial event")
+            .expect("initial event should not error");
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(33_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_pending = timeout(Duration::from_secs(20), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .seen_ats
+                            .iter()
+                            .any(|(seen_txid, _)| *seen_txid == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw_pending, "expected pending update before disconnect");
+
+        client.disconnect();
+
+        env.bitcoind
+            .client
+            .generate_to_address(1, &env.bitcoind.client.new_address().unwrap())
+            .unwrap();
+        let confirmed_height = env.bitcoind.client.get_blockchain_info().unwrap().blocks as usize;
+        env.electrsd.wait_height(confirmed_height);
+
+        let reconnected_client = connected_bdk_client(&env).await;
+        let reconnect_request = FullScanRequest::<String>::builder_at(0)
+            .chain_tip(current_tip_checkpoint(&env))
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut reconnect_stream = reconnected_client.sync(reconnect_request).await.unwrap();
+
+        let initial = reconnect_stream
+            .next()
+            .await
+            .expect("expected initial event after reconnect")
+            .expect("initial event after reconnect should not error");
+        match initial {
+            SubscribeEvent::Initial(initial) => {
+                assert!(
+                    initial
+                        .tx_update
+                        .anchors
+                        .iter()
+                        .any(|(_, anchor_txid)| *anchor_txid == txid),
+                    "expected reconnected scan to include confirmed anchor"
+                );
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn sync_stream_emits_disconnected_event_on_disconnect() {
         let env = TestEnv::new();
         let client = connected_bdk_client(&env).await;
@@ -2517,6 +2980,7 @@ mod tests {
     async fn subscribe_scripts_does_not_mutate_state_on_subscription_failure() {
         let client = test_bdk_client();
         let mut subscribed_hashes = HashSet::new();
+        let mut script_subscriptions = HashMap::new();
         let hash = ElectrumScriptHash::new(&script(0x71));
         let scripts = vec![(hash, 0, ScriptSubscription::new(HashMap::new()))];
 
@@ -2535,7 +2999,7 @@ mod tests {
 
         assert!(
             client
-                .subscribe_scripts(&scripts, &mut subscribed_hashes)
+                .subscribe_scripts(&scripts, &mut subscribed_hashes, &mut script_subscriptions)
                 .await
                 .is_err()
         );
@@ -2544,8 +3008,8 @@ mod tests {
             "local subscribed hash set must remain unchanged on failure"
         );
         assert!(
-            client.subscription_tracker.lock().await.is_empty(),
-            "tracker must remain unchanged on failure"
+            script_subscriptions.is_empty(),
+            "local script subscriptions must remain unchanged on failure"
         );
     }
 
@@ -2858,13 +3322,13 @@ mod tests {
 
         {
             let mut scripts = ctx.subscribed_scripts.lock().await;
+            let mut script_subscriptions = ctx.script_subscriptions.lock().await;
             let mut lookup = ctx.script_to_keychain_index.lock().await;
-            let mut tracker = client.subscription_tracker.lock().await;
             for (index, tag) in [(0_u32, 0x81_u8), (1, 0x82), (2, 0x83)] {
                 let hash = ElectrumScriptHash::new(&script(tag));
                 scripts.insert(hash);
                 lookup.insert(hash, ("external".to_string(), index));
-                tracker.insert(hash, ScriptSubscription::new(HashMap::new()));
+                script_subscriptions.insert(hash, ScriptSubscription::new(HashMap::new()));
             }
         }
         {
