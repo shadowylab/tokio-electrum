@@ -5,7 +5,7 @@
 #![warn(clippy::large_futures)]
 #![warn(rustdoc::bare_urls)]
 
-mod bdk_electrum_client;
+mod client;
 mod util;
 
-pub use bdk_electrum_client::*;
+pub use self::client::*;
