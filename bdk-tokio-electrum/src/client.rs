@@ -69,6 +69,19 @@ where
         let scripts = self.subscribed_scripts.lock().await;
         scripts.iter().copied().collect()
     }
+
+    async fn script_hashes_with_unconfirmed_txs(&self) -> Vec<ElectrumScriptHash> {
+        let subscriptions = self.script_subscriptions.lock().await;
+        subscriptions
+            .iter()
+            .filter_map(|(hash, sub)| {
+                sub.expected_tx_heights
+                    .values()
+                    .any(|height| *height <= 0)
+                    .then_some(*hash)
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -656,11 +669,16 @@ impl BdkElectrumClient {
             }
         }
 
-        let scripts_to_process: Vec<ElectrumScriptHash> = if batch.lagged {
+        let mut scripts_to_process: Vec<ElectrumScriptHash> = if batch.lagged {
             ctx.tracked_script_hashes().await
         } else {
             batch.dirty_scripts.drain().collect()
         };
+        if chain_update.is_some() {
+            scripts_to_process.extend(ctx.script_hashes_with_unconfirmed_txs().await);
+            let mut dedup = HashSet::with_capacity(scripts_to_process.len());
+            scripts_to_process.retain(|hash| dedup.insert(*hash));
+        }
         batch.lagged = false;
 
         for hash in scripts_to_process {
@@ -908,6 +926,7 @@ impl BdkElectrumClient {
 
         let expected_txids: HashSet<Txid> = expected_tx_heights.keys().copied().collect();
         let current_txids: HashSet<Txid> = current_tx_heights.keys().copied().collect();
+        let mut next_expected_tx_heights = current_tx_heights.clone();
 
         // Build a TxUpdate with the changes
         let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
@@ -931,15 +950,21 @@ impl BdkElectrumClient {
             }
 
             if is_new_tx || status_changed {
-                match electrum_height.try_into() {
+                let anchored = match electrum_height.try_into() {
                     Ok(height) if height > 0 => {
                         self.validate_merkle_for_anchor(&mut tx_update, txid, height)
-                            .await?;
+                            .await?
                     }
-                    _ => {
-                        tx_update.seen_ats.insert((txid, start_time));
-                    }
-                }
+                    _ => false,
+                };
+                apply_confirmation_tracking(
+                    txid,
+                    start_time,
+                    electrum_height,
+                    anchored,
+                    &mut tx_update,
+                    &mut next_expected_tx_heights,
+                );
             }
         }
 
@@ -951,7 +976,7 @@ impl BdkElectrumClient {
         // Update our tracker with the new expected txids
         let mut subscriptions = ctx.script_subscriptions.lock().await;
         if let Some(subscription) = subscriptions.get_mut(&script_hash) {
-            subscription.expected_tx_heights = current_tx_heights;
+            subscription.expected_tx_heights = next_expected_tx_heights;
         }
 
         Ok(Some(SyncResponse {
@@ -1014,18 +1039,13 @@ impl BdkElectrumClient {
             let mut batch_loaded_indexes: BTreeSet<u32> = BTreeSet::new();
 
             for ((spk_index, spk), spk_history) in spks.into_iter().zip(spk_histories) {
-                let spk_history_heights: HashMap<Txid, i64> = spk_history
+                let mut spk_history_heights: HashMap<Txid, i64> = spk_history
                     .iter()
                     .map(|res| (res.txid(), res.electrum_height()))
                     .collect();
                 let spk_history_txids: HashSet<Txid> =
                     spk_history_heights.keys().copied().collect();
                 let script_hash = ElectrumScriptHash::new(&spk.spk);
-                scripts_to_subscribe.push((
-                    script_hash,
-                    spk_index,
-                    ScriptSubscription::new(spk_history_heights.clone()),
-                ));
                 result.max_subscribed_index = Some(
                     result
                         .max_subscribed_index
@@ -1050,19 +1070,33 @@ impl BdkElectrumClient {
                 );
 
                 for tx_res in spk_history {
-                    let tx = self.fetch_tx(tx_res.txid()).await?;
+                    let txid = tx_res.txid();
+                    let electrum_height = tx_res.electrum_height();
+                    let tx = self.fetch_tx(txid).await?;
                     tx_update.txs.push(tx);
-                    match tx_res.electrum_height().try_into() {
+                    let anchored = match electrum_height.try_into() {
                         // Returned heights 0 & -1 are reserved for unconfirmed txs.
                         Ok(height) if height > 0 => {
-                            self.validate_merkle_for_anchor(tx_update, tx_res.txid(), height)
-                                .await?;
+                            self.validate_merkle_for_anchor(tx_update, txid, height)
+                                .await?
                         }
-                        _ => {
-                            tx_update.seen_ats.insert((tx_res.txid(), start_time));
-                        }
-                    }
+                        _ => false,
+                    };
+                    apply_confirmation_tracking(
+                        txid,
+                        start_time,
+                        electrum_height,
+                        anchored,
+                        tx_update,
+                        &mut spk_history_heights,
+                    );
                 }
+
+                scripts_to_subscribe.push((
+                    script_hash,
+                    spk_index,
+                    ScriptSubscription::new(spk_history_heights),
+                ));
             }
 
             util::log_loading_indexes(wallet_label, keychain, batch_loaded_indexes);
@@ -1116,42 +1150,59 @@ impl BdkElectrumClient {
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
         txid: Txid,
         confirmation_height: u32,
-    ) -> Result<(), Error> {
-        if let Ok(merkle_res) = self
+    ) -> Result<bool, Error> {
+        let merkle_res = match self
             .inner
             .transaction_get_merkle(txid, confirmation_height)
             .await
         {
-            let mut header = self
-                .fetch_header(merkle_res.block_height.to_consensus_u32())
+            Ok(merkle) => merkle,
+            Err(e) => {
+                tracing::debug!(
+                    txid = %txid,
+                    confirmation_height,
+                    error = %e,
+                    "Could not fetch merkle proof for confirmed tx yet."
+                );
+                return Ok(false);
+            }
+        };
+
+        let mut header = self
+            .fetch_header(merkle_res.block_height.to_consensus_u32())
+            .await?;
+        let mut is_confirmed_tx =
+            util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
+
+        // Merkle validation will fail if the header in `block_header_cache` is outdated, so we
+        // want to check if there is a new header and validate against the new one.
+        if !is_confirmed_tx {
+            header = self
+                .update_header(merkle_res.block_height.to_consensus_u32())
                 .await?;
-            let mut is_confirmed_tx =
-                util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
-
-            // Merkle validation will fail if the header in `block_header_cache` is outdated, so we
-            // want to check if there is a new header and validate against the new one.
-            if !is_confirmed_tx {
-                header = self
-                    .update_header(merkle_res.block_height.to_consensus_u32())
-                    .await?;
-                is_confirmed_tx =
-                    util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
-            }
-
-            if is_confirmed_tx {
-                tx_update.anchors.insert((
-                    ConfirmationBlockTime {
-                        confirmation_time: header.time as u64,
-                        block_id: BlockId {
-                            height: merkle_res.block_height.to_consensus_u32(),
-                            hash: header.block_hash(),
-                        },
-                    },
-                    txid,
-                ));
-            }
+            is_confirmed_tx = util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
         }
-        Ok(())
+
+        if is_confirmed_tx {
+            tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    confirmation_time: header.time as u64,
+                    block_id: BlockId {
+                        height: merkle_res.block_height.to_consensus_u32(),
+                        hash: header.block_hash(),
+                    },
+                },
+                txid,
+            ));
+            return Ok(true);
+        }
+
+        tracing::debug!(
+            txid = %txid,
+            confirmation_height,
+            "Merkle proof validation failed for confirmed tx."
+        );
+        Ok(false)
     }
 
     /// Fetch previous transaction outputs for fee calculation.
@@ -1293,6 +1344,24 @@ where
             }))
         }
         None => None,
+    }
+}
+
+fn apply_confirmation_tracking(
+    txid: Txid,
+    start_time: u64,
+    electrum_height: i64,
+    anchored: bool,
+    tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+    next_expected_tx_heights: &mut HashMap<Txid, i64>,
+) {
+    if electrum_height > 0 {
+        if !anchored {
+            tx_update.seen_ats.insert((txid, start_time));
+            next_expected_tx_heights.insert(txid, 0);
+        }
+    } else {
+        tx_update.seen_ats.insert((txid, start_time));
     }
 }
 
@@ -1503,6 +1572,105 @@ mod tests {
             updated.get(6).is_none(),
             "height beyond tip must be ignored"
         );
+    }
+
+    #[test]
+    fn apply_confirmation_tracking_keeps_pending_when_anchor_missing() {
+        let txid = txid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let start_time = 42;
+        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+        let mut next_expected = HashMap::from([(txid, 120_i64)]);
+
+        apply_confirmation_tracking(
+            txid,
+            start_time,
+            120,
+            false,
+            &mut tx_update,
+            &mut next_expected,
+        );
+
+        assert!(tx_update.seen_ats.contains(&(txid, start_time)));
+        assert_eq!(next_expected.get(&txid), Some(&0));
+    }
+
+    #[test]
+    fn apply_confirmation_tracking_keeps_confirmed_when_anchor_is_present() {
+        let txid = txid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let start_time = 77;
+        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+        let mut next_expected = HashMap::from([(txid, 200_i64)]);
+
+        apply_confirmation_tracking(
+            txid,
+            start_time,
+            200,
+            true,
+            &mut tx_update,
+            &mut next_expected,
+        );
+
+        assert!(!tx_update.seen_ats.contains(&(txid, start_time)));
+        assert_eq!(next_expected.get(&txid), Some(&200));
+    }
+
+    #[test]
+    fn apply_confirmation_tracking_marks_unconfirmed_as_seen() {
+        let txid = txid("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        let start_time = 11;
+        let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
+        let mut next_expected = HashMap::from([(txid, -1_i64)]);
+
+        apply_confirmation_tracking(
+            txid,
+            start_time,
+            -1,
+            false,
+            &mut tx_update,
+            &mut next_expected,
+        );
+
+        assert!(tx_update.seen_ats.contains(&(txid, start_time)));
+        assert_eq!(next_expected.get(&txid), Some(&-1));
+    }
+
+    #[tokio::test]
+    async fn script_hashes_with_unconfirmed_txs_returns_only_pending_scripts() {
+        let request = FullScanRequest::<String>::builder_at(0).build();
+        let ctx = ctx_for_request(request);
+        let hash_confirmed = ElectrumScriptHash::new(&script(0x31));
+        let hash_pending_a = ElectrumScriptHash::new(&script(0x32));
+        let hash_pending_b = ElectrumScriptHash::new(&script(0x33));
+
+        let mut subscriptions = ctx.script_subscriptions.lock().await;
+        subscriptions.insert(
+            hash_confirmed,
+            ScriptSubscription::new(HashMap::from([(
+                txid("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+                500_i64,
+            )])),
+        );
+        subscriptions.insert(
+            hash_pending_a,
+            ScriptSubscription::new(HashMap::from([(
+                txid("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                0_i64,
+            )])),
+        );
+        subscriptions.insert(
+            hash_pending_b,
+            ScriptSubscription::new(HashMap::from([(
+                txid("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                -1_i64,
+            )])),
+        );
+        drop(subscriptions);
+
+        let pending = ctx.script_hashes_with_unconfirmed_txs().await;
+        let pending: HashSet<ElectrumScriptHash> = pending.into_iter().collect();
+        assert!(pending.contains(&hash_pending_a));
+        assert!(pending.contains(&hash_pending_b));
+        assert!(!pending.contains(&hash_confirmed));
     }
 
     #[tokio::test]
