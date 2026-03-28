@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Display, Write};
 
 use bdk_core::bitcoin::Txid;
 use bdk_core::bitcoin::hash_types::TxMerkleNode;
 use bdk_core::bitcoin::hashes::sha256d::Hash as Sha256d;
 use bdk_core::bitcoin::hashes::{Hash, HashEngine};
+use bdk_core::{ConfirmationBlockTime, TxUpdate};
 use tokio_electrum::prelude::*;
 
 /// Verifies a Merkle inclusion proof as retrieved via [`transaction_get_merkle`] for a transaction with the
@@ -38,6 +39,13 @@ pub(crate) fn validate_merkle_proof(
     }
 
     cur == merkle_root.to_raw_hash()
+}
+
+pub(crate) fn dedup_tx_update_txs(tx_update: &mut TxUpdate<ConfirmationBlockTime>) {
+    let mut seen_txids = HashSet::with_capacity(tx_update.txs.len());
+    tx_update
+        .txs
+        .retain(|tx| seen_txids.insert(tx.compute_txid()));
 }
 
 #[inline]
