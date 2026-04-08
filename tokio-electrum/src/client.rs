@@ -234,24 +234,26 @@ impl InnerClient {
 
     async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
         // Validate network
-        if let Some(expected_network) = self.config.expected_network {
-            let features: ServerFeatures =
-                send_request_with_timeout(client, Duration::from_secs(10), GetServerFeatures)
-                    .await?;
+        let Some(expected_network) = self.config.expected_network else {
+            return Ok(());
+        };
 
-            let server_chain_hash: ChainHash =
-                ChainHash::from_genesis_block_hash(features.genesis_hash);
+        let features: ServerFeatures =
+            send_request_with_timeout(client, self.config.request_timeout, GetServerFeatures)
+                .await?;
 
-            if server_chain_hash != expected_network.chain_hash() {
-                // Set network mismatch
-                self.tracker.set_network_mismatch(true);
+        let server_chain_hash: ChainHash =
+            ChainHash::from_genesis_block_hash(features.genesis_hash);
 
-                // Mark as terminated
-                self.set_status(InternalElectrumConnectionStatus::Terminated, true);
+        if server_chain_hash != expected_network.chain_hash() {
+            // Set network mismatch
+            self.tracker.set_network_mismatch(true);
 
-                // Return error
-                return Err(Error::NetworkMismatch);
-            }
+            // Mark as terminated
+            self.set_status(InternalElectrumConnectionStatus::Terminated, true);
+
+            // Return error
+            return Err(Error::NetworkMismatch);
         }
 
         Ok(())
