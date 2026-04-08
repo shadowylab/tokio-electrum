@@ -503,7 +503,7 @@ impl InnerClient {
                 // Ping channel receiver
                 _ = self.channels.ping.notified() => {
                     tracing::trace!(addr = %self.addr, "Sending ping.");
-                    send_request_with_timeout(client, Duration::from_secs(5), Ping).await?;
+                    send_request_with_timeout(client, self.config.request_timeout, Ping).await?;
                     tracing::trace!(addr = %self.addr, "Ping sent.");
                 }
                 else => break
@@ -583,11 +583,11 @@ impl InnerClient {
 
     async fn pinger(&self) {
         loop {
+            // Sleep first to avoid forcing a ping immediately after connection bootstrap.
+            time::sleep(PING_INTERVAL).await;
+
             // Ping!
             self.channels.ping();
-
-            // Sleep
-            time::sleep(PING_INTERVAL).await;
         }
     }
 
