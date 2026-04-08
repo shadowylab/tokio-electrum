@@ -1,6 +1,6 @@
 //! Electrum client
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
@@ -28,7 +28,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, MutexGuard, Notify, broadcast, mpsc};
 use tokio::time;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -159,8 +159,6 @@ impl Channels {
 #[derive(Debug, Default)]
 struct ServicesTracker {
     network_mismatch: AtomicBool,
-    headers_subscribed: AtomicBool,
-    script_hashes: RwLock<HashSet<ElectrumScriptHash>>,
 }
 
 impl ServicesTracker {
@@ -172,25 +170,6 @@ impl ServicesTracker {
     #[inline]
     fn set_network_mismatch(&self, value: bool) {
         self.network_mismatch.store(value, Ordering::SeqCst);
-    }
-
-    #[inline]
-    fn is_headers_subscribed(&self) -> bool {
-        self.headers_subscribed.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    fn set_headers_subscribed(&self, value: bool) {
-        self.headers_subscribed.store(value, Ordering::SeqCst);
-    }
-
-    async fn reset(&self) {
-        // Reset headers subscription
-        self.set_headers_subscribed(false);
-
-        // Reset script hashes
-        let mut script_hashes = self.script_hashes.write().await;
-        script_hashes.clear();
     }
 }
 
@@ -297,9 +276,6 @@ impl InnerClient {
             return;
         }
 
-        // Reset service tracker
-        self.tracker.reset().await;
-
         // Lock receiver
         let mut rx_batch_requests = self.channels.rx_batch_requests().await;
 
@@ -405,54 +381,6 @@ impl InnerClient {
         // Construct new electrum async client
         let (client, receiver, worker) = AsyncClient::new_tokio(reader, writer);
 
-        // If the header subscription was enabled, resubscribe.
-        if self.tracker.is_headers_subscribed() {
-            tracing::debug!(addr = %self.addr, "Resubscribing to headers.");
-
-            let mut batch = AsyncBatchRequest::new();
-            batch.event_request(HeadersSubscribe);
-
-            match client.send_batch(batch) {
-                Ok(true) => {
-                    tracing::debug!(addr = %self.addr, "Successfully resubscribed to headers.")
-                }
-                Ok(false) => tracing::warn!(addr = %self.addr, "Headers subscription failed."),
-                Err(e) => {
-                    tracing::error!(addr = %self.addr, error = %e, "Error during headers resubscribe.")
-                }
-            }
-        }
-
-        {
-            // Acquire read lock
-            let script_hashes = self.tracker.script_hashes.read().await;
-
-            // If are cached any script hashes, resubscribe.
-            if !script_hashes.is_empty() {
-                tracing::debug!(addr = %self.addr, "Resubscribing to {} script hashes.", script_hashes.len());
-
-                let mut batch = AsyncBatchRequest::new();
-
-                for script_hash in script_hashes.iter().copied() {
-                    batch.event_request(ScriptHashSubscribe { script_hash });
-                }
-
-                drop(script_hashes);
-
-                match client.send_batch(batch) {
-                    Ok(true) => {
-                        tracing::debug!(addr = %self.addr, "Successfully resubscribed to script hashes.")
-                    }
-                    Ok(false) => {
-                        tracing::warn!(addr = %self.addr, "Script hashes subscription failed.")
-                    }
-                    Err(e) => {
-                        tracing::error!(addr = %self.addr, error = %e, "Error during script hashes resubscribe.")
-                    }
-                }
-            }
-        }
-
         // Wait that one of the futures terminates/completes
         // Add also termination here, to allow closing the connection in case of termination request.
         tokio::select! {
@@ -523,30 +451,16 @@ impl InnerClient {
                     SatisfiedRequest::HeadersSubscribe { resp, .. } => {
                         tracing::debug!(addr = %self.addr, "Subscribed to headers.");
 
-                        // Mark as subscribed
-                        self.tracker.set_headers_subscribed(true);
-
                         Some(ElectrumNotification::BlockHeader {
                             height: resp.height,
                             header: resp.header,
                         })
                     }
                     SatisfiedRequest::ScriptHashSubscribe { req, resp } => {
-                        // Mark as subscribed
-                        let mut script_hashes_set = self.tracker.script_hashes.write().await;
-                        script_hashes_set.insert(req.script_hash);
-
                         Some(ElectrumNotification::ScriptHash {
                             hash: req.script_hash,
                             status: resp,
                         })
-                    }
-                    SatisfiedRequest::ScriptHashUnsubscribe { req, .. } => {
-                        // Mark as unsubscribed
-                        let mut script_hashes_set = self.tracker.script_hashes.write().await;
-                        script_hashes_set.remove(&req.script_hash);
-
-                        None
                     }
                     _ => None,
                 },
@@ -808,9 +722,6 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     pub async fn get_tip(&self) -> Result<BlockHeader, Error> {
-        // Explicitly mark as subscribed, also if we mark it again in receiver_message_handler
-        self.inner.tracker.set_headers_subscribed(true);
-
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(HeadersSubscribe);
 
@@ -825,9 +736,6 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     pub fn block_headers_subscribe(&self) -> Result<(), Error> {
-        // Explicitly mark as subscribed, also if we mark it again in receiver_message_handler
-        self.inner.tracker.set_headers_subscribed(true);
-
         let mut batch = AsyncBatchRequest::new();
         batch.event_request(HeadersSubscribe);
         self.inner.send_batch(batch)?;
