@@ -109,6 +109,9 @@ struct Config {
     connection_timeout: Duration,
     request_timeout: Duration,
     ping_timeout: Duration,
+    reconnect_delay_initial: Duration,
+    reconnect_delay_max: Duration,
+    max_consecutive_ping_timeouts: u8,
     expected_network: Option<Network>,
 }
 
@@ -124,8 +127,8 @@ struct Channels {
 }
 
 impl Channels {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(4096);
+    pub fn new(command_channel_size: usize) -> Self {
+        let (tx, rx) = mpsc::channel(command_channel_size);
         let rx = Mutex::new(rx);
 
         Self {
@@ -281,6 +284,7 @@ impl InnerClient {
 
         // Lock receiver
         let mut rx_batch_requests = self.channels.rx_batch_requests().await;
+        let mut reconnect_attempt: u32 = 0;
 
         // Auto-connect loop
         loop {
@@ -303,7 +307,13 @@ impl InnerClient {
             }
 
             // Sleep before retry to connect
-            let interval: Duration = Duration::from_secs(10); // TODO: move this to a constant
+            let interval = next_reconnect_interval(
+                reconnect_attempt,
+                self.config.reconnect_delay_initial,
+                self.config.reconnect_delay_max,
+            );
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+
             tracing::debug!(
                 "Reconnecting to '{}' in {} secs",
                 self.addr,
@@ -423,16 +433,13 @@ impl InnerClient {
         self.validate_network(client).await?;
 
         let mut consecutive_ping_timeouts: u8 = 0;
+        let max_ping_timeouts = self.config.max_consecutive_ping_timeouts;
 
         // Start the receiver loop
         loop {
             tokio::select! {
-                // Batch request receiver
-                Some(batch_request) = rx_batch_request.recv() => {
-                    tracing::trace!("Sending batch request: {:?}", batch_request);
-
-                    client.send_batch(batch_request)?;
-                }
+                // "biased" in tokio::select! makes branch selection priority-based, top to bottom, instead of fair/randomized.
+                biased;
                 // Ping channel receiver
                 _ = self.channels.ping.notified() => {
                     tracing::trace!(addr = %self.addr, "Sending ping.");
@@ -450,7 +457,7 @@ impl InnerClient {
                                 "Electrum ping timed out."
                             );
 
-                            if consecutive_ping_timeouts < 3 {
+                            if consecutive_ping_timeouts < max_ping_timeouts {
                                 continue;
                             }
 
@@ -459,6 +466,12 @@ impl InnerClient {
                         Err(e) => return Err(e),
                     }
                     tracing::trace!(addr = %self.addr, "Ping sent.");
+                }
+                // Batch request receiver
+                Some(batch_request) = rx_batch_request.recv() => {
+                    tracing::trace!("Sending batch request: {:?}", batch_request);
+
+                    client.send_batch(batch_request)?;
                 }
                 else => break
             }
@@ -531,17 +544,19 @@ impl InnerClient {
         }
     }
 
-    #[inline]
-    fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
+    async fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
         if self.tracker.network_mismatch() {
             return Err(Error::NetworkMismatch);
         }
 
-        self.channels
-            .commands
-            .0
-            .try_send(batch)
-            .map_err(|e| Error::MpscTrySend(e.to_string()))
+        let send_result = time::timeout(
+            self.config.request_timeout,
+            self.channels.commands.0.send(batch),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?;
+
+        send_result.map_err(|e| Error::MpscTrySend(e.to_string()))
     }
 }
 
@@ -593,7 +608,7 @@ impl ElectrumClient {
                 addr: builder.addr,
                 status: AtomicElectrumConnectionStatus::default(),
                 running: AtomicBool::new(false),
-                channels: Channels::new(),
+                channels: Channels::new(builder.command_channel_size),
                 tracker: ServicesTracker::default(),
                 notification_sender,
                 config: Config {
@@ -601,6 +616,9 @@ impl ElectrumClient {
                     connection_timeout: builder.connection_timeout,
                     request_timeout: builder.request_timeout,
                     ping_timeout: builder.ping_timeout,
+                    reconnect_delay_initial: builder.reconnect_delay_initial,
+                    reconnect_delay_max: builder.reconnect_delay_max,
+                    max_consecutive_ping_timeouts: builder.max_consecutive_ping_timeouts.max(1),
                     expected_network: builder.expected_network,
                 },
             }),
@@ -707,7 +725,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetServerFeatures);
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -719,7 +737,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetBlockHeader { height });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -738,7 +756,7 @@ impl ElectrumClient {
             count,
         });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -752,7 +770,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(HeadersSubscribe);
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -762,10 +780,10 @@ impl ElectrumClient {
     /// Subscribe to block headers
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
-    pub fn block_headers_subscribe(&self) -> Result<(), Error> {
+    pub async fn block_headers_subscribe(&self) -> Result<(), Error> {
         let mut batch = AsyncBatchRequest::new();
         batch.event_request(HeadersSubscribe);
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
         Ok(())
     }
 
@@ -773,17 +791,17 @@ impl ElectrumClient {
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
     #[inline]
-    pub fn script_hash_subscribe<T>(&self, script_hash: T) -> Result<(), Error>
+    pub async fn script_hash_subscribe<T>(&self, script_hash: T) -> Result<(), Error>
     where
         T: Into<ElectrumScriptHash>,
     {
-        self.batch_script_hash_subscribe(vec![script_hash])
+        self.batch_script_hash_subscribe(vec![script_hash]).await
     }
 
     /// Subscribe to script hashes
     ///
     /// The updates can be monitored with [`ElectrumClient::notifications`].
-    pub fn batch_script_hash_subscribe<I, T>(&self, script_hashes: I) -> Result<(), Error>
+    pub async fn batch_script_hash_subscribe<I, T>(&self, script_hashes: I) -> Result<(), Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<ElectrumScriptHash>,
@@ -796,13 +814,13 @@ impl ElectrumClient {
             });
         }
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         Ok(())
     }
 
     /// Unsubscribe from a script hash
-    pub fn script_hash_unsubscribe<T>(&self, script_hash: T) -> Result<(), Error>
+    pub async fn script_hash_unsubscribe<T>(&self, script_hash: T) -> Result<(), Error>
     where
         T: Into<ElectrumScriptHash>,
     {
@@ -810,7 +828,7 @@ impl ElectrumClient {
         batch.event_request(ScriptHashUnsubscribe {
             script_hash: script_hash.into(),
         });
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
         Ok(())
     }
 
@@ -824,7 +842,7 @@ impl ElectrumClient {
             script_hash: script_hash.into(),
         });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -851,7 +869,7 @@ impl ElectrumClient {
             futures.push(fut);
         }
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
@@ -869,7 +887,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetTx { txid });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -885,7 +903,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(GetTxMerkle { txid, height });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -899,7 +917,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(EstimateFee { number });
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -922,7 +940,7 @@ impl ElectrumClient {
             futures.push(fut);
         }
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
@@ -942,7 +960,7 @@ impl ElectrumClient {
         let mut batch = AsyncBatchRequest::new();
         let fut = batch.request(BroadcastTx(tx));
 
-        self.inner.send_batch(batch)?;
+        self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(fut).await??;
 
@@ -1081,6 +1099,26 @@ where
         .map_err(|_| Error::Timeout)??)
 }
 
+fn next_reconnect_interval(attempt: u32, initial: Duration, max: Duration) -> Duration {
+    // Guard against zero/invalid values configured by consumers.
+    let initial = if initial.is_zero() {
+        Duration::from_millis(250)
+    } else {
+        initial
+    };
+    let max = max.max(initial);
+
+    // Exponential backoff with deterministic jitter capped at 250ms.
+    let factor: u32 = 1_u32 << attempt.min(10);
+    let base = initial.checked_mul(factor).unwrap_or(max).min(max);
+    let jitter_ms: u64 = (u64::from(attempt) * 73) % 251;
+
+    let interval: Duration = base.saturating_add(Duration::from_millis(jitter_ms));
+
+    // Take the min interval
+    interval.min(max)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "socks")]
@@ -1103,6 +1141,72 @@ mod tests {
         ElectrumClient::builder(addr)
             .request_timeout(request_timeout)
             .build()
+    }
+
+    #[test]
+    fn test_builder_wires_runtime_tuning() {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        let client = ElectrumClient::builder(addr)
+            .request_timeout(Duration::from_secs(55))
+            .ping_timeout(Duration::from_secs(9))
+            .reconnect_delay_initial(Duration::from_secs(1))
+            .reconnect_delay_max(Duration::from_secs(8))
+            .max_consecutive_ping_timeouts(0)
+            .command_channel_size(2048)
+            .build();
+
+        assert_eq!(client.inner.config.request_timeout, Duration::from_secs(55));
+        assert_eq!(client.inner.config.ping_timeout, Duration::from_secs(9));
+        assert_eq!(
+            client.inner.config.reconnect_delay_initial,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            client.inner.config.reconnect_delay_max,
+            Duration::from_secs(8)
+        );
+        // Must clamp to at least 1.
+        assert_eq!(client.inner.config.max_consecutive_ping_timeouts, 1);
+    }
+
+    #[test]
+    fn test_next_reconnect_interval_bounds_and_growth() {
+        assert_eq!(
+            next_reconnect_interval(0, Duration::from_secs(2), Duration::from_secs(30)),
+            Duration::from_secs(2)
+        );
+
+        assert_eq!(
+            next_reconnect_interval(1, Duration::from_secs(2), Duration::from_secs(30)),
+            Duration::from_secs(4) + Duration::from_millis(73)
+        );
+
+        // Capped at max.
+        assert_eq!(
+            next_reconnect_interval(20, Duration::from_secs(2), Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+
+        // Zero initial is sanitized.
+        assert_eq!(
+            next_reconnect_interval(0, Duration::ZERO, Duration::from_secs(1)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_send_batch_times_out_when_queue_is_full() {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        let client = ElectrumClient::builder(addr)
+            .request_timeout(Duration::from_millis(50))
+            .command_channel_size(1)
+            .build();
+
+        // Fill command queue (no connection task is running, so nothing drains it).
+        client.block_headers_subscribe().await.unwrap();
+
+        let err = client.server_features().await.expect_err("must timeout");
+        assert!(matches!(err, Error::Timeout));
     }
 
     #[tokio::test]
@@ -1198,12 +1302,15 @@ mod tests {
         assert!(client.inner.running.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn test_send_batch_returns_network_mismatch() {
+    #[tokio::test]
+    async fn test_send_batch_returns_network_mismatch() {
         let client = test_client();
         client.inner.tracker.set_network_mismatch(true);
 
-        let err = client.block_headers_subscribe().expect_err("must fail");
+        let err = client
+            .block_headers_subscribe()
+            .await
+            .expect_err("must fail");
         assert!(matches!(err, Error::NetworkMismatch));
     }
 
@@ -1398,7 +1505,7 @@ mod tests {
         let tracked_address = env.bitcoind.client.new_address().unwrap();
         let tracked_hash = ElectrumScriptHash::new(&tracked_address.script_pubkey());
 
-        client.script_hash_subscribe(tracked_hash).unwrap();
+        client.script_hash_subscribe(tracked_hash).await.unwrap();
 
         let txid = env
             .bitcoind
@@ -1428,8 +1535,8 @@ mod tests {
             "expected script notification while subscribed"
         );
 
-        client.script_hash_unsubscribe(tracked_hash).unwrap();
-        client.script_hash_subscribe(tracked_hash).unwrap();
+        client.script_hash_unsubscribe(tracked_hash).await.unwrap();
+        client.script_hash_subscribe(tracked_hash).await.unwrap();
 
         // Drain queue to avoid matching stale events from the previous tx.
         while notifications.try_recv().is_ok() {}
@@ -1506,7 +1613,7 @@ mod tests {
             .unwrap();
         assert!(!headers.headers.is_empty(), "expected headers response");
 
-        client.block_headers_subscribe().unwrap();
+        client.block_headers_subscribe().await.unwrap();
 
         let hash_a = ElectrumScriptHash::new(&addr_a.script_pubkey());
         let hash_b = ElectrumScriptHash::new(&addr_b.script_pubkey());

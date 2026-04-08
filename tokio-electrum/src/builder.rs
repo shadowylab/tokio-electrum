@@ -7,8 +7,9 @@ use std::time::Duration;
 use bitcoin::Network;
 
 use super::constant::{
-    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_PING_TIMEOUT,
-    DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_COMMAND_CHANNEL_SIZE, DEFAULT_CONNECTION_TIMEOUT,
+    DEFAULT_MAX_CONSECUTIVE_PING_TIMEOUTS, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_PING_TIMEOUT,
+    DEFAULT_RECONNECT_DELAY_INITIAL, DEFAULT_RECONNECT_DELAY_MAX, DEFAULT_REQUEST_TIMEOUT,
 };
 use crate::address::ElectrumServerAddress;
 use crate::client::ElectrumClient;
@@ -37,6 +38,14 @@ pub struct ElectrumClientBuilder {
     pub request_timeout: Duration,
     /// Ping timeout
     pub ping_timeout: Duration,
+    /// Initial reconnect delay
+    pub reconnect_delay_initial: Duration,
+    /// Maximum reconnect delay
+    pub reconnect_delay_max: Duration,
+    /// Max consecutive ping timeouts before forcing disconnect
+    pub max_consecutive_ping_timeouts: u8,
+    /// Command channel size
+    pub command_channel_size: usize,
     /// Notification channel size
     pub notification_channel_size: usize,
     /// Expected Bitcoin network
@@ -55,6 +64,10 @@ impl ElectrumClientBuilder {
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             ping_timeout: DEFAULT_PING_TIMEOUT,
+            reconnect_delay_initial: DEFAULT_RECONNECT_DELAY_INITIAL,
+            reconnect_delay_max: DEFAULT_RECONNECT_DELAY_MAX,
+            max_consecutive_ping_timeouts: DEFAULT_MAX_CONSECUTIVE_PING_TIMEOUTS,
+            command_channel_size: DEFAULT_COMMAND_CHANNEL_SIZE,
             notification_channel_size: DEFAULT_NOTIFICATION_CHANNEL_SIZE,
             expected_network: None,
         }
@@ -85,6 +98,34 @@ impl ElectrumClientBuilder {
     #[inline]
     pub fn ping_timeout(mut self, timeout: Duration) -> Self {
         self.ping_timeout = timeout;
+        self
+    }
+
+    /// Set a custom initial reconnect delay (default: 2 secs)
+    #[inline]
+    pub fn reconnect_delay_initial(mut self, delay: Duration) -> Self {
+        self.reconnect_delay_initial = delay;
+        self
+    }
+
+    /// Set a custom maximum reconnect delay (default: 30 secs)
+    #[inline]
+    pub fn reconnect_delay_max(mut self, delay: Duration) -> Self {
+        self.reconnect_delay_max = delay;
+        self
+    }
+
+    /// Set max consecutive ping timeouts before forcing reconnect (default: 3)
+    #[inline]
+    pub fn max_consecutive_ping_timeouts(mut self, max: u8) -> Self {
+        self.max_consecutive_ping_timeouts = max;
+        self
+    }
+
+    /// Set a custom command channel size (default: 4096)
+    #[inline]
+    pub fn command_channel_size(mut self, size: usize) -> Self {
+        self.command_channel_size = size;
         self
     }
 

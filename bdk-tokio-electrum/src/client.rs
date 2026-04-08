@@ -478,7 +478,8 @@ impl BdkElectrumClient {
 
         // Subscribe via Electrum first (this can fail)
         self.inner
-            .batch_script_hash_subscribe(script_hashes.iter().copied())?;
+            .batch_script_hash_subscribe(script_hashes.iter().copied())
+            .await?;
 
         let new_max_subscribed = scripts_to_subscribe
             .iter()
@@ -737,7 +738,8 @@ impl BdkElectrumClient {
         script_subscriptions: &mut HashMap<ElectrumScriptHash, ScriptSubscription>,
     ) -> Result<(), Error> {
         self.inner
-            .batch_script_hash_subscribe(scripts.iter().map(|(hash, _, _)| *hash))?;
+            .batch_script_hash_subscribe(scripts.iter().map(|(hash, _, _)| *hash))
+            .await?;
 
         for (hash, _, subscription) in scripts {
             script_subscriptions.insert(*hash, subscription.clone());
@@ -1065,7 +1067,11 @@ mod tests {
 
     fn test_bdk_client() -> BdkElectrumClient {
         let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
-        BdkElectrumClient::new(ElectrumClient::new(addr))
+        BdkElectrumClient::new(
+            ElectrumClient::builder(addr)
+                .request_timeout(Duration::from_secs(2))
+                .build(),
+        )
     }
 
     fn ctx_for_request(request: FullScanRequest<String>) -> SubscriptionCtx<String> {
@@ -2631,7 +2637,7 @@ mod tests {
             .expect("initial event should not error");
 
         // Subscribe directly on the underlying client to force unrelated script notifications.
-        client.script_hash_subscribe(other_hash).unwrap();
+        client.script_hash_subscribe(other_hash).await.unwrap();
         let txid = env
             .bitcoind
             .client
@@ -2726,7 +2732,7 @@ mod tests {
         let mut saturated = false;
         for i in 0..10_000_u32 {
             let queued_hash = ElectrumScriptHash::new(&script((i % 251) as u8));
-            if client.script_hash_subscribe(queued_hash).is_err() {
+            if client.script_hash_subscribe(queued_hash).await.is_err() {
                 saturated = true;
                 break;
             }
