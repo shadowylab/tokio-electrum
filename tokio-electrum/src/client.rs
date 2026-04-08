@@ -108,6 +108,7 @@ struct Config {
     connection_mode: ElectrumConnectionMode,
     connection_timeout: Duration,
     request_timeout: Duration,
+    ping_timeout: Duration,
     expected_network: Option<Network>,
 }
 
@@ -421,6 +422,8 @@ impl InnerClient {
         // Validate the network before start processing the requests
         self.validate_network(client).await?;
 
+        let mut consecutive_ping_timeouts: u8 = 0;
+
         // Start the receiver loop
         loop {
             tokio::select! {
@@ -433,7 +436,28 @@ impl InnerClient {
                 // Ping channel receiver
                 _ = self.channels.ping.notified() => {
                     tracing::trace!(addr = %self.addr, "Sending ping.");
-                    send_request_with_timeout(client, self.config.request_timeout, Ping).await?;
+
+                    match send_request_with_timeout(client, self.config.ping_timeout, Ping).await {
+                        Ok(()) => {
+                            consecutive_ping_timeouts = 0;
+                        }
+                        Err(Error::Timeout) => {
+                            consecutive_ping_timeouts = consecutive_ping_timeouts.saturating_add(1);
+
+                            tracing::warn!(
+                                addr = %self.addr,
+                                consecutive_ping_timeouts,
+                                "Electrum ping timed out."
+                            );
+
+                            if consecutive_ping_timeouts < 3 {
+                                continue;
+                            }
+
+                            return Err(Error::Timeout);
+                        }
+                        Err(e) => return Err(e),
+                    }
                     tracing::trace!(addr = %self.addr, "Ping sent.");
                 }
                 else => break
@@ -576,6 +600,7 @@ impl ElectrumClient {
                     connection_mode: builder.connection_mode,
                     connection_timeout: builder.connection_timeout,
                     request_timeout: builder.request_timeout,
+                    ping_timeout: builder.ping_timeout,
                     expected_network: builder.expected_network,
                 },
             }),

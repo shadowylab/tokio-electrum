@@ -7,7 +7,8 @@ use std::time::Duration;
 use bitcoin::Network;
 
 use super::constant::{
-    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_NOTIFICATION_CHANNEL_SIZE, DEFAULT_PING_TIMEOUT,
+    DEFAULT_REQUEST_TIMEOUT,
 };
 use crate::address::ElectrumServerAddress;
 use crate::client::ElectrumClient;
@@ -34,6 +35,8 @@ pub struct ElectrumClientBuilder {
     pub connection_timeout: Duration,
     /// Request timeout
     pub request_timeout: Duration,
+    /// Ping timeout
+    pub ping_timeout: Duration,
     /// Notification channel size
     pub notification_channel_size: usize,
     /// Expected Bitcoin network
@@ -51,6 +54,7 @@ impl ElectrumClientBuilder {
             connection_mode: ElectrumConnectionMode::default(),
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            ping_timeout: DEFAULT_PING_TIMEOUT,
             notification_channel_size: DEFAULT_NOTIFICATION_CHANNEL_SIZE,
             expected_network: None,
         }
@@ -74,6 +78,13 @@ impl ElectrumClientBuilder {
     #[inline]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Set a custom ping timeout (default: 15 secs)
+    #[inline]
+    pub fn ping_timeout(mut self, timeout: Duration) -> Self {
+        self.ping_timeout = timeout;
         self
     }
 
