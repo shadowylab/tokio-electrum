@@ -19,7 +19,6 @@ socks = ["dep:tokio-socks"]
 bitcoin = "0.32"
 electrum_streaming_client = { git = "https://github.com/yukibtc/electrum_streaming_client", branch = "missing-features-req-patch", features = ["tokio"] }
 futures-util.workspace = true
-thiserror = "2.0"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-socks = { version =  "0.5", optional = true }

@@ -1,12 +1,12 @@
 //! Electrum client
 
 use std::collections::BTreeMap;
-use std::io;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use std::{fmt, io};
 
 use bitcoin::block::Header;
 use bitcoin::constants::ChainHash;
@@ -24,7 +24,6 @@ use electrum_streaming_client::{
     Request, ResponseError, SatisfiedRequest,
 };
 use futures_util::{StreamExt, future};
-use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -51,45 +50,100 @@ type BoxReadStream = Box<dyn AsyncRead + Send + Unpin>;
 type BoxWriteStream = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// Electrum client error
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum Error {
     /// I/O error
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    Io(io::Error),
     /// Invalid DNS name
-    #[error(transparent)]
-    InvalidDnsName(#[from] InvalidDnsNameError),
+    InvalidDnsName(InvalidDnsNameError),
     /// Electrum async send request error
-    #[error(transparent)]
-    AsyncRequestSend(#[from] AsyncRequestSendError),
+    AsyncRequestSend(AsyncRequestSendError),
     /// Batch request error
-    #[error(transparent)]
-    BatchRequest(#[from] BatchRequestError),
+    BatchRequest(BatchRequestError),
     /// Electrum async request error
-    #[error(transparent)]
-    AsyncRequest(#[from] AsyncRequestError),
+    AsyncRequest(AsyncRequestError),
     /// Response error
-    #[error(transparent)]
-    Response(#[from] ResponseError),
+    Response(ResponseError),
     /// Socks error
-    #[error(transparent)]
     #[cfg(feature = "socks")]
-    Socks(#[from] tokio_socks::Error),
+    Socks(tokio_socks::Error),
     /// MPSC try send error
-    #[error("{0}")]
     MpscTrySend(String),
     /// Network mismatch
-    #[error("the server network does not match the expected network")]
     NetworkMismatch,
     /// Timeout
-    #[error("timeout")]
     Timeout,
     /// Disconnected
-    #[error("disconnected")]
     Disconnected,
     /// Termination request
-    #[error("termination request")]
     TerminationRequest,
+}
+
+impl core::error::Error for Error {}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::InvalidDnsName(e) => e.fmt(f),
+            Self::AsyncRequestSend(e) => e.fmt(f),
+            Self::BatchRequest(e) => e.fmt(f),
+            Self::AsyncRequest(e) => e.fmt(f),
+            Self::Response(e) => e.fmt(f),
+            #[cfg(feature = "socks")]
+            Self::Socks(e) => e.fmt(f),
+            Self::MpscTrySend(e) => e.fmt(f),
+            Self::NetworkMismatch => {
+                f.write_str("the server network does not match the expected network")
+            }
+            Self::Timeout => f.write_str("timeout"),
+            Self::Disconnected => f.write_str("disconnected"),
+            Self::TerminationRequest => f.write_str("termination request"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<InvalidDnsNameError> for Error {
+    fn from(e: InvalidDnsNameError) -> Self {
+        Self::InvalidDnsName(e)
+    }
+}
+
+impl From<AsyncRequestSendError> for Error {
+    fn from(e: AsyncRequestSendError) -> Self {
+        Self::AsyncRequestSend(e)
+    }
+}
+
+impl From<BatchRequestError> for Error {
+    fn from(e: BatchRequestError) -> Self {
+        Self::BatchRequest(e)
+    }
+}
+
+impl From<AsyncRequestError> for Error {
+    fn from(e: AsyncRequestError) -> Self {
+        Self::AsyncRequest(e)
+    }
+}
+
+impl From<ResponseError> for Error {
+    fn from(e: ResponseError) -> Self {
+        Self::Response(e)
+    }
+}
+
+#[cfg(feature = "socks")]
+impl From<tokio_socks::Error> for Error {
+    fn from(e: tokio_socks::Error) -> Self {
+        Self::Socks(e)
+    }
 }
 
 impl Error {

@@ -5,32 +5,45 @@ use std::net::IpAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
-use thiserror::Error;
-
 /// Electrum address parse error
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// Parse int error
-    #[error(transparent)]
-    ParseInt(#[from] ParseIntError),
+    ParseInt(ParseIntError),
     /// Invalid format
-    #[error("invalid format")]
     InvalidFormat,
     /// Missing scheme
-    #[error("missing scheme")]
     MissingScheme,
     /// Invalid address scheme
-    #[error("invalid scheme")]
     InvalidScheme,
     /// Missing host
-    #[error("missing host")]
     MissingHost,
     /// Empty host
-    #[error("empty host")]
     EmptyHost,
     /// Missing port
-    #[error("missing port")]
     MissingPort,
+}
+
+impl core::error::Error for Error {}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParseInt(e) => e.fmt(f),
+            Self::InvalidFormat => write!(f, "invalid format"),
+            Self::MissingScheme => write!(f, "missing scheme"),
+            Self::InvalidScheme => write!(f, "invalid scheme"),
+            Self::MissingHost => write!(f, "missing host"),
+            Self::EmptyHost => write!(f, "empty host"),
+            Self::MissingPort => write!(f, "missing port"),
+        }
+    }
+}
+
+impl From<ParseIntError> for Error {
+    fn from(e: ParseIntError) -> Self {
+        Self::ParseInt(e)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
