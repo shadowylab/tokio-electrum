@@ -34,13 +34,13 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::crypto::ring;
 use tokio_rustls::rustls::pki_types::{InvalidDnsNameError, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+#[cfg(feature = "socks")]
+use tokio_socks::tcp::Socks5Stream;
 
 use crate::address::{ElectrumServerAddress, HostAndPort, Scheme};
 use crate::builder::{ElectrumClientBuilder, ElectrumConnectionMode};
 use crate::constant::PING_INTERVAL;
 use crate::notification::ElectrumNotification;
-#[cfg(feature = "socks")]
-use crate::socks::TcpSocks5Stream;
 use crate::status::{
     AtomicElectrumConnectionStatus, ElectrumConnectionStatus, InternalElectrumConnectionStatus,
 };
@@ -1072,7 +1072,9 @@ async fn connect_proxy_tcp(
     addr: &HostAndPort,
     proxy: SocketAddr,
 ) -> Result<(BoxReadStream, BoxWriteStream), Error> {
-    let stream: TcpStream = TcpSocks5Stream::connect(proxy, addr.to_string()).await?;
+    let stream: TcpStream = Socks5Stream::connect(proxy, addr.to_string())
+        .await?
+        .into_inner();
 
     // Split stream
     Ok(split_stream(stream))
@@ -1103,7 +1105,9 @@ async fn connect_proxy_ssl(
     proxy: SocketAddr,
 ) -> Result<(BoxReadStream, BoxWriteStream), Error> {
     // Connect to the server
-    let tcp_stream: TcpStream = TcpSocks5Stream::connect(proxy, addr.to_string()).await?;
+    let tcp_stream: TcpStream = Socks5Stream::connect(proxy, addr.to_string())
+        .await?
+        .into_inner();
 
     // Create TLS configuration
     ssl_connector(addr, tcp_stream).await
