@@ -23,7 +23,7 @@ use electrum_streaming_client::{
     AsyncPendingRequestTuple, AsyncRequestError, AsyncRequestSendError, BatchRequestError, Event,
     Request, ResponseError, SatisfiedRequest,
 };
-use futures::{StreamExt, future};
+use futures_util::{StreamExt, future};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;

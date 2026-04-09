@@ -99,7 +99,7 @@ version = "0.1.0"
 dependencies = [
  "bdk_core",
  "bdk_wallet",
- "futures",
+ "futures-util",
  "testenv",
  "tokio",
  "tokio-electrum",
@@ -1172,7 +1172,7 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "electrum_streaming_client",
- "futures",
+ "futures-util",
  "testenv",
  "thiserror 2.0.16",
  "tokio",

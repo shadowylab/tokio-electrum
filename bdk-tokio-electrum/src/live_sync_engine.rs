@@ -6,7 +6,7 @@ use std::time::Duration;
 use bdk_core::bitcoin::block::Header;
 use bdk_core::spk_client::{FullScanRequest, FullScanResponse, SyncResponse};
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
-use futures::stream;
+use futures_util::stream;
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Instant, timeout_at};
 use tokio_electrum::client::Error;

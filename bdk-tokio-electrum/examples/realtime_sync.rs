@@ -3,7 +3,7 @@ use std::time::Duration;
 use bdk_core::bitcoin::Network;
 use bdk_tokio_electrum::{BdkElectrumClient, SubscribeEvent};
 use bdk_wallet::Wallet;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use tokio_electrum::prelude::*;
 
 #[tokio::main]
