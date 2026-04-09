@@ -75,7 +75,7 @@ where
         }
     }
 
-    /// Set a stop gap (default: 50)
+    /// Set a stop gap (default: 20)
     #[inline]
     pub fn stop_gap(mut self, stop_gap: usize) -> Self {
         self.stop_gap = stop_gap;
