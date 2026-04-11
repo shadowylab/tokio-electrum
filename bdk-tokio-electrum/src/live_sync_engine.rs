@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ pub(crate) struct LiveSyncEngine<K> {
     pub(crate) ctx: Arc<SubscriptionCtx<K>>,
     pub(crate) start_time: u64,
     pub(crate) fetch_prev_txouts: bool,
-    pub(crate) stop_gap: usize,
+    pub(crate) stop_gap: NonZeroU32,
     pub(crate) batch_window: Duration,
 }
 
@@ -61,7 +62,7 @@ where
         fetch_prev_txouts: bool,
         request: FullScanRequest<K>,
         response: &FullScanResponse<K>,
-        stop_gap: usize,
+        stop_gap: NonZeroU32,
         batch_window: Duration,
     ) -> Self {
         let ctx = Arc::new(SubscriptionCtx {

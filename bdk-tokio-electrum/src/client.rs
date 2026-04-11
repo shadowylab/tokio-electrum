@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,8 +53,8 @@ pub enum SubscribeEvent<K> {
 pub struct SyncWallet<'client, K> {
     client: &'client BdkElectrumClient,
     request: FullScanRequest<K>,
-    stop_gap: usize,
-    batch_size: usize,
+    stop_gap: NonZeroU32,
+    batch_size: NonZeroU32,
     fetch_prev_txouts: bool,
     batch_window: Duration,
     label: String,
@@ -77,14 +78,14 @@ where
 
     /// Set a stop gap (default: 20)
     #[inline]
-    pub fn stop_gap(mut self, stop_gap: usize) -> Self {
+    pub fn stop_gap(mut self, stop_gap: NonZeroU32) -> Self {
         self.stop_gap = stop_gap;
         self
     }
 
     /// Set a batch size (default: 20)
     #[inline]
-    pub fn batch_size(mut self, batch_size: usize) -> Self {
+    pub fn batch_size(mut self, batch_size: NonZeroU32) -> Self {
         self.batch_size = batch_size;
         self
     }
@@ -234,8 +235,8 @@ impl BdkElectrumClient {
         &self,
         wallet_label: &str,
         request: &mut FullScanRequest<K>,
-        stop_gap: usize,
-        batch_size: usize,
+        stop_gap: NonZeroU32,
+        batch_size: NonZeroU32,
         fetch_prev_txouts: bool,
     ) -> Result<(FullScanResponse<K>, SubscriptionInit<K>), Error>
     where
@@ -319,8 +320,8 @@ impl BdkElectrumClient {
     async fn run_sync<K>(
         &self,
         mut request: FullScanRequest<K>,
-        stop_gap: usize,
-        batch_size: usize,
+        stop_gap: NonZeroU32,
+        batch_size: NonZeroU32,
         fetch_prev_txouts: bool,
         batch_window: Duration,
         wallet_label: String,
@@ -366,7 +367,7 @@ impl BdkElectrumClient {
         hash: ElectrumScriptHash,
         start_time: u64,
         fetch_prev_txouts: bool,
-        stop_gap: usize,
+        stop_gap: NonZeroU32,
         ctx: &SubscriptionCtx<K>,
     ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error>
     where
@@ -393,7 +394,7 @@ impl BdkElectrumClient {
     async fn maybe_extend_after_script_update<K>(
         &self,
         hash: ElectrumScriptHash,
-        stop_gap: usize,
+        stop_gap: NonZeroU32,
         ctx: &SubscriptionCtx<K>,
         update: &SyncResponse<ConfirmationBlockTime>,
     ) -> Result<(), Error>
@@ -421,7 +422,7 @@ impl BdkElectrumClient {
         &self,
         keychain: K,
         new_active_index: u32,
-        stop_gap: usize,
+        stop_gap: NonZeroU32,
         ctx: &SubscriptionCtx<K>,
     ) -> Result<(), Error>
     where
@@ -434,10 +435,7 @@ impl BdkElectrumClient {
                 .get(&keychain)
                 .copied()
                 .unwrap_or(new_active_index);
-            (
-                current_max,
-                new_active_index.saturating_add(stop_gap as u32),
-            )
+            (current_max, new_active_index.saturating_add(stop_gap.get()))
         };
 
         if current_max >= target_index {
@@ -608,14 +606,18 @@ impl BdkElectrumClient {
         start_time: u64,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
         mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
-        stop_gap: usize,
-        batch_size: usize,
+        stop_gap: NonZeroU32,
+        batch_size: NonZeroU32,
         keychain: &K,
     ) -> Result<SpkScanResult, Error>
     where
         K: Display,
     {
-        let mut unused_spk_count = 0_usize;
+        let stop_gap: usize = stop_gap.get() as usize;
+        let batch_size: u32 = batch_size.get();
+
+        let mut unused_spk_count: usize = 0;
+
         let mut result = SpkScanResult {
             last_active_index: None,
             subscribed_hashes: HashSet::new(),
@@ -1433,7 +1435,7 @@ mod tests {
         advance_request_cursor(&ctx, "external", 1).await;
 
         client
-            .subscribe_incremental("external".to_string(), 0, 2, &ctx)
+            .subscribe_incremental("external".to_string(), 0, NonZeroU32::new(2).unwrap(), &ctx)
             .await
             .unwrap();
 
@@ -1475,7 +1477,12 @@ mod tests {
         advance_request_cursor(&ctx, "external", 2).await;
 
         client
-            .subscribe_incremental("external".to_string(), 10, 3, &ctx)
+            .subscribe_incremental(
+                "external".to_string(),
+                10,
+                NonZeroU32::new(3).unwrap(),
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -1490,7 +1497,7 @@ mod tests {
         let hash = ElectrumScriptHash::new(&script(0x41));
 
         let update = client
-            .handle_script_hash_notification(hash, 0, false, 2, &ctx)
+            .handle_script_hash_notification(hash, 0, false, NonZeroU32::new(2).unwrap(), &ctx)
             .await;
         assert!(update.unwrap().is_none());
     }
@@ -1527,7 +1534,13 @@ mod tests {
         advance_request_cursor(&ctx, "external", 3).await;
 
         let update = client
-            .handle_script_hash_notification(trigger_hash, 0, false, 2, &ctx)
+            .handle_script_hash_notification(
+                trigger_hash,
+                0,
+                false,
+                NonZeroU32::new(2).unwrap(),
+                &ctx,
+            )
             .await;
         assert!(
             update.unwrap().is_none(),
@@ -1589,7 +1602,12 @@ mod tests {
         };
 
         client
-            .maybe_extend_after_script_update(trigger_hash, 2, &ctx, &update)
+            .maybe_extend_after_script_update(
+                trigger_hash,
+                NonZeroU32::new(2).unwrap(),
+                &ctx,
+                &update,
+            )
             .await
             .unwrap();
 
@@ -1647,7 +1665,12 @@ mod tests {
         };
 
         client
-            .maybe_extend_after_script_update(trigger_hash, 2, &ctx, &update)
+            .maybe_extend_after_script_update(
+                trigger_hash,
+                NonZeroU32::new(2).unwrap(),
+                &ctx,
+                &update,
+            )
             .await
             .unwrap();
 
@@ -3088,11 +3111,11 @@ mod tests {
         advance_request_cursor(&ctx, "external", 3).await;
 
         client
-            .subscribe_incremental("external".to_string(), 3, 2, &ctx)
+            .subscribe_incremental("external".to_string(), 3, NonZeroU32::new(2).unwrap(), &ctx)
             .await
             .unwrap();
         client
-            .subscribe_incremental("external".to_string(), 5, 2, &ctx)
+            .subscribe_incremental("external".to_string(), 5, NonZeroU32::new(2).unwrap(), &ctx)
             .await
             .unwrap();
 
