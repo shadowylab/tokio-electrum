@@ -72,6 +72,8 @@ pub enum Error {
     MpscTrySend(String),
     /// Network mismatch
     NetworkMismatch,
+    /// Local command queue is saturated
+    CommandQueueSaturated,
     /// Timeout
     Timeout,
     /// Disconnected
@@ -96,6 +98,9 @@ impl fmt::Display for Error {
             Self::MpscTrySend(e) => e.fmt(f),
             Self::NetworkMismatch => {
                 f.write_str("the server network does not match the expected network")
+            }
+            Self::CommandQueueSaturated => {
+                f.write_str("the local electrum command queue is saturated")
             }
             Self::Timeout => f.write_str("timeout"),
             Self::Disconnected => f.write_str("disconnected"),
@@ -609,7 +614,7 @@ impl InnerClient {
             self.channels.commands.0.send(batch),
         )
         .await
-        .map_err(|_| Error::Timeout)?;
+        .map_err(|_| Error::CommandQueueSaturated)?;
 
         send_result.map_err(|e| Error::MpscTrySend(e.to_string()))
     }
@@ -1270,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_send_batch_times_out_when_queue_is_full() {
+    async fn async_send_batch_returns_command_queue_saturated_when_queue_is_full() {
         let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
         let client = ElectrumClient::builder(addr)
             .request_timeout(Duration::from_millis(50))
@@ -1280,8 +1285,11 @@ mod tests {
         // Fill command queue (no connection task is running, so nothing drains it).
         client.block_headers_subscribe().await.unwrap();
 
-        let err = client.server_features().await.expect_err("must timeout");
-        assert!(matches!(err, Error::Timeout));
+        let err = client
+            .server_features()
+            .await
+            .expect_err("must fail with local backpressure");
+        assert!(matches!(err, Error::CommandQueueSaturated));
     }
 
     #[tokio::test]
