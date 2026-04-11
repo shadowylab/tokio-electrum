@@ -14,12 +14,12 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use tokio::sync::{Mutex, RwLock};
 pub use tokio_electrum::client::{ElectrumClient, Error};
-use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
+use tokio_electrum::types::{BlockHeader, ElectrumScriptHash, TransactionMerkel};
 
 use crate::accumulator::FullScanAccumulator;
 use crate::constant::{
     CHAIN_SUFFIX_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_WINDOW, DEFAULT_STOP_GAP,
-    DEFAULT_WALLET_LABEL,
+    DEFAULT_WALLET_LABEL, INITIAL_SCAN_MERKLE_BATCH_SIZE, INITIAL_SCAN_TX_BATCH_SIZE,
 };
 use crate::live_sync_engine::LiveSyncEngine;
 use crate::subscription::{ScriptSubscription, SubscriptionCtx, SubscriptionInit};
@@ -203,6 +203,98 @@ impl BdkElectrumClient {
         tx_cache.insert(txid, tx.clone());
 
         Ok(tx)
+    }
+
+    /// Fetch transactions for the given txids while leveraging the local cache.
+    async fn fetch_txs_cached<I>(&self, txids: I) -> Result<HashMap<Txid, Arc<Transaction>>, Error>
+    where
+        I: IntoIterator<Item = Txid>,
+    {
+        let mut output: HashMap<Txid, Arc<Transaction>> = HashMap::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+
+        {
+            let tx_cache = self.tx_cache.read().await;
+            for txid in txids.into_iter() {
+                if !seen.insert(txid) {
+                    continue;
+                }
+
+                if let Some(tx) = tx_cache.get(&txid) {
+                    output.insert(txid, Arc::clone(tx));
+                } else {
+                    missing.push(txid);
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            for txid_chunk in missing.chunks(INITIAL_SCAN_TX_BATCH_SIZE) {
+                let fetched = self
+                    .inner
+                    .batch_transaction_get(txid_chunk.iter().copied())
+                    .await?;
+                let mut tx_cache = self.tx_cache.write().await;
+
+                for tx in fetched {
+                    let tx = Arc::new(tx);
+                    let txid = tx.compute_txid();
+                    tx_cache.insert(txid, Arc::clone(&tx));
+                    output.insert(txid, tx);
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Prefetch merkle proofs for confirmed transactions and cache anchor results for reuse.
+    async fn prefetch_merkle_anchors(
+        &self,
+        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+        confirmed_pairs: Vec<(Txid, u32)>,
+    ) -> Result<HashMap<(Txid, u32), bool>, Error> {
+        let mut cached = HashMap::new();
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+
+        for pair in confirmed_pairs {
+            if seen.insert(pair) {
+                unique.push(pair);
+            }
+        }
+
+        for pair_chunk in unique.chunks(INITIAL_SCAN_MERKLE_BATCH_SIZE) {
+            let responses = self
+                .inner
+                .batch_transaction_get_merkle(pair_chunk.iter().copied())
+                .await?;
+
+            for ((txid, requested_height), merkle_res) in pair_chunk.iter().copied().zip(responses)
+            {
+                match merkle_res {
+                    Ok(merkle) => {
+                        let anchored = self
+                            .validate_and_insert_anchor_from_merkle(tx_update, txid, merkle)
+                            .await?;
+                        if anchored {
+                            cached.insert((txid, requested_height), true);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            txid = %txid,
+                            confirmation_height = requested_height,
+                            error = %e,
+                            "Could not prefetch merkle proof for confirmed tx yet."
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(cached)
     }
 
     /// Fetch block header of given `height`.
@@ -626,6 +718,26 @@ impl BdkElectrumClient {
                 .inner
                 .batch_script_get_history(spks.iter().map(|(_, s)| s.spk.as_script()))
                 .await?;
+            let batch_txids: Vec<Txid> = spk_histories
+                .iter()
+                .flat_map(|history| history.iter().map(|res| res.txid()))
+                .collect();
+            let txs_by_id = self.fetch_txs_cached(batch_txids).await?;
+            let confirmed_pairs: Vec<(Txid, u32)> = spk_histories
+                .iter()
+                .flat_map(|history| {
+                    history.iter().filter_map(|res| {
+                        let height = res.electrum_height();
+                        if height <= 0 {
+                            return None;
+                        }
+                        u32::try_from(height).ok().map(|h| (res.txid(), h))
+                    })
+                })
+                .collect();
+            let prefetched_anchors = self
+                .prefetch_merkle_anchors(tx_update, confirmed_pairs)
+                .await?;
 
             let mut scripts_to_subscribe: Vec<(ElectrumScriptHash, u32, ScriptSubscription)> =
                 Vec::new();
@@ -666,14 +778,20 @@ impl BdkElectrumClient {
                 for tx_res in spk_history {
                     let txid = tx_res.txid();
                     let electrum_height = tx_res.electrum_height();
-                    let tx = self.fetch_tx(txid).await?;
+                    let tx = match txs_by_id.get(&txid) {
+                        Some(tx) => Arc::clone(tx),
+                        None => self.fetch_tx(txid).await?,
+                    };
                     tx_update.txs.push(tx);
                     let anchored = match electrum_height.try_into() {
                         // Returned heights 0 & -1 are reserved for unconfirmed txs.
-                        Ok(height) if height > 0 => {
-                            self.validate_merkle_for_anchor(tx_update, txid, height)
-                                .await?
-                        }
+                        Ok(height) if height > 0 => match prefetched_anchors.get(&(txid, height)) {
+                            Some(anchored) => *anchored,
+                            None => {
+                                self.validate_merkle_for_anchor(tx_update, txid, height)
+                                    .await?
+                            }
+                        },
                         _ => false,
                     };
                     apply_confirmation_tracking(
@@ -763,18 +881,26 @@ impl BdkElectrumClient {
             }
         };
 
-        let mut header = self
-            .fetch_header(merkle_res.block_height.to_consensus_u32())
-            .await?;
+        self.validate_and_insert_anchor_from_merkle(tx_update, txid, merkle_res)
+            .await
+    }
+
+    /// Validate a merkle proof and insert a confirmation anchor when valid.
+    async fn validate_and_insert_anchor_from_merkle(
+        &self,
+        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+        txid: Txid,
+        merkle_res: TransactionMerkel,
+    ) -> Result<bool, Error> {
+        let confirmation_height = merkle_res.block_height.to_consensus_u32();
+        let mut header = self.fetch_header(confirmation_height).await?;
         let mut is_confirmed_tx =
             util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
 
         // Merkle validation will fail if the header in `block_header_cache` is outdated, so we
         // want to check if there is a new header and validate against the new one.
         if !is_confirmed_tx {
-            header = self
-                .update_header(merkle_res.block_height.to_consensus_u32())
-                .await?;
+            header = self.update_header(confirmation_height).await?;
             is_confirmed_tx = util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
         }
 
@@ -783,7 +909,7 @@ impl BdkElectrumClient {
                 ConfirmationBlockTime {
                     confirmation_time: header.time as u64,
                     block_id: BlockId {
-                        height: merkle_res.block_height.to_consensus_u32(),
+                        height: confirmation_height,
                         hash: header.block_hash(),
                     },
                 },
