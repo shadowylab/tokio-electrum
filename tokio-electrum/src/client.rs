@@ -938,10 +938,12 @@ impl ElectrumClient {
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
 
-        let mut output = Vec::new();
+        let mut output: Vec<Vec<Tx>> = Vec::with_capacity(resp.len());
 
-        for txs in resp.into_iter().flatten() {
-            output.push(txs);
+        // Propagate error
+        // This avoids silently dropping the error, which may cause a partial sync.
+        for txs in resp {
+            output.push(txs?);
         }
 
         Ok(output)
