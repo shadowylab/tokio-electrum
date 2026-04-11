@@ -862,11 +862,17 @@ impl ElectrumClient {
         T: Into<ElectrumScriptHash>,
     {
         let mut batch = AsyncBatchRequest::new();
+        let mut has_requests = false;
 
         for script_hash in script_hashes {
+            has_requests = true;
             batch.event_request(ScriptHashSubscribe {
                 script_hash: script_hash.into(),
             });
+        }
+
+        if !has_requests {
+            return Ok(());
         }
 
         self.inner.send_batch(batch).await?;
@@ -922,6 +928,10 @@ impl ElectrumClient {
                 script_hash: script_hash.into(),
             });
             futures.push(fut);
+        }
+
+        if futures.is_empty() {
+            return Ok(Vec::new());
         }
 
         self.inner.send_batch(batch).await?;
@@ -993,6 +1003,10 @@ impl ElectrumClient {
             let fut = batch.request(EstimateFee { number });
             indexes.push(number);
             futures.push(fut);
+        }
+
+        if futures.is_empty() {
+            return Ok(BTreeMap::new());
         }
 
         self.inner.send_batch(batch).await?;
