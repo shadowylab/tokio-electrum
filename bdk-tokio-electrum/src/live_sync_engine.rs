@@ -15,6 +15,7 @@ use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::prelude::ElectrumScriptHash;
 
 use crate::client::{BdkElectrumClient, SubscribeEvent, SubscribeStream};
+use crate::constant::LIVE_SYNC_HISTORY_BATCH_SIZE;
 use crate::subscription::{SubscriptionCtx, SubscriptionInit, SubscriptionState};
 use crate::util::dedup_tx_update_txs;
 
@@ -270,22 +271,25 @@ where
     ) -> Result<TxUpdate<ConfirmationBlockTime>, Error> {
         let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
 
-        for hash in scripts_to_process {
+        for chunk in scripts_to_process.chunks(LIVE_SYNC_HISTORY_BATCH_SIZE) {
             match self
                 .client
-                .handle_script_hash_notification(
-                    hash,
+                .process_script_hash_updates_batch(
+                    chunk,
                     self.start_time,
                     self.fetch_prev_txouts,
-                    self.stop_gap,
                     &self.ctx,
                 )
                 .await
             {
-                Ok(Some(update)) => {
-                    tx_update.extend(update.tx_update);
+                Ok(processed) => {
+                    tx_update.extend(processed.tx_update);
+                    for hash in processed.hashes_with_new_txs {
+                        self.client
+                            .maybe_extend_after_activity(hash, self.stop_gap, &self.ctx)
+                            .await?;
+                    }
                 }
-                Ok(None) => {}
                 Err(e) if e.is_disconnected_like() => {
                     batch.disconnected = true;
                     break;
