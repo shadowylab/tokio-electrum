@@ -966,6 +966,36 @@ impl ElectrumClient {
         Ok(resp.tx)
     }
 
+    /// Batch get transactions.
+    pub async fn batch_transaction_get<I>(&self, txids: I) -> Result<Vec<Transaction>, Error>
+    where
+        I: IntoIterator<Item = Txid>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+        let mut futures = Vec::new();
+
+        for txid in txids {
+            let fut = batch.request(GetTx { txid });
+            futures.push(fut);
+        }
+
+        if futures.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.inner.send_batch(batch).await?;
+
+        let resp = self.wait_batch_response(future::join_all(futures)).await?;
+        let mut output = Vec::with_capacity(resp.len());
+
+        // Propagate error to avoid partial sync results.
+        for tx in resp {
+            output.push(tx?.tx);
+        }
+
+        Ok(output)
+    }
+
     /// Get transaction merkle
     pub async fn transaction_get_merkle(
         &self,
@@ -1719,6 +1749,9 @@ mod tests {
 
         let tx = client.transaction_get(txid_a).await.unwrap();
         assert_eq!(tx.compute_txid(), txid_a);
+        let batched = client.batch_transaction_get([txid_a]).await.unwrap();
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].compute_txid(), txid_a);
 
         let confirmed = single_history
             .into_iter()
