@@ -1012,6 +1012,38 @@ impl ElectrumClient {
         Ok(TransactionMerkel::from(resp))
     }
 
+    /// Batch get transaction merkle proofs.
+    ///
+    /// Per-request failures are returned inline so callers can decide whether to retry or
+    /// continue partial processing.
+    pub async fn batch_transaction_get_merkle<I>(
+        &self,
+        txids_and_heights: I,
+    ) -> Result<Vec<Result<TransactionMerkel, Error>>, Error>
+    where
+        I: IntoIterator<Item = (Txid, u32)>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+        let mut futures = Vec::new();
+
+        for (txid, height) in txids_and_heights {
+            let fut = batch.request(GetTxMerkle { txid, height });
+            futures.push(fut);
+        }
+
+        if futures.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.inner.send_batch(batch).await?;
+
+        let resp = self.wait_batch_response(future::join_all(futures)).await?;
+        Ok(resp
+            .into_iter()
+            .map(|res| res.map(TransactionMerkel::from).map_err(Error::from))
+            .collect())
+    }
+
     /// Return the estimated transaction fee for a transaction to be confirmed within a certain number of blocks.
     ///
     /// Returns `None` if the server could not estimate.
@@ -1764,6 +1796,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(merkle.block_height.to_consensus_u32(), confirmation_height);
+        let merkle_batch = client
+            .batch_transaction_get_merkle([(confirmed.txid(), confirmation_height)])
+            .await
+            .unwrap();
+        assert_eq!(merkle_batch.len(), 1);
+        let batch_entry = merkle_batch.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            batch_entry.block_height.to_consensus_u32(),
+            confirmation_height
+        );
 
         let _ = client.estimate_fee(2).await.unwrap();
         let fee_estimates = client.batch_estimate_fee([1_usize, 2, 6]).await.unwrap();
