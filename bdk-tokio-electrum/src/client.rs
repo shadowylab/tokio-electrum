@@ -1013,6 +1013,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1777,7 +1778,7 @@ mod tests {
 
     async fn connected_bdk_client_with_notification_channel(
         env: &TestEnv,
-        notification_channel_size: usize,
+        notification_channel_size: NonZeroUsize,
     ) -> BdkElectrumClient {
         let addr =
             ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
@@ -2906,7 +2907,9 @@ mod tests {
     async fn sync_stream_lag_recovery_catches_up_tracked_scripts() {
         let env = TestEnv::new();
         ensure_funded_wallet(&env);
-        let client = connected_bdk_client_with_notification_channel(&env, 4).await;
+        let client =
+            connected_bdk_client_with_notification_channel(&env, NonZeroUsize::new(4).unwrap())
+                .await;
 
         let tracked_address = env.bitcoind.client.new_address().unwrap();
         let request = FullScanRequest::<String>::builder_at(0)

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -181,8 +182,8 @@ struct Channels {
 }
 
 impl Channels {
-    pub fn new(command_channel_size: usize) -> Self {
-        let (tx, rx) = mpsc::channel(command_channel_size);
+    pub fn new(command_channel_size: NonZeroUsize) -> Self {
+        let (tx, rx) = mpsc::channel(command_channel_size.get());
         let rx = Mutex::new(rx);
 
         Self {
@@ -655,7 +656,7 @@ impl ElectrumClient {
     }
 
     pub(crate) fn from_builder(builder: ElectrumClientBuilder) -> Self {
-        let (notification_sender, ..) = broadcast::channel(builder.notification_channel_size);
+        let (notification_sender, ..) = broadcast::channel(builder.notification_channel_size.get());
 
         Self {
             inner: Arc::new(InnerClient {
@@ -1210,7 +1211,7 @@ mod tests {
             .reconnect_delay_initial(Duration::from_secs(1))
             .reconnect_delay_max(Duration::from_secs(8))
             .max_consecutive_ping_timeouts(0)
-            .command_channel_size(2048)
+            .command_channel_size(NonZeroUsize::new(2048).unwrap())
             .build();
 
         assert_eq!(client.inner.config.request_timeout, Duration::from_secs(55));
@@ -1257,7 +1258,7 @@ mod tests {
         let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
         let client = ElectrumClient::builder(addr)
             .request_timeout(Duration::from_millis(50))
-            .command_channel_size(1)
+            .command_channel_size(NonZeroUsize::new(1).unwrap())
             .build();
 
         // Fill command queue (no connection task is running, so nothing drains it).

@@ -2,6 +2,7 @@
 
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bitcoin::Network;
@@ -45,9 +46,9 @@ pub struct ElectrumClientBuilder {
     /// Max consecutive ping timeouts before forcing disconnect
     pub max_consecutive_ping_timeouts: u8,
     /// Command channel size
-    pub command_channel_size: usize,
+    pub command_channel_size: NonZeroUsize,
     /// Notification channel size
-    pub notification_channel_size: usize,
+    pub notification_channel_size: NonZeroUsize,
     /// Expected Bitcoin network
     ///
     /// When specified, the client will verify that the server operates on the same network during connection.
@@ -124,14 +125,14 @@ impl ElectrumClientBuilder {
 
     /// Set a custom command channel size (default: 4096)
     #[inline]
-    pub fn command_channel_size(mut self, size: usize) -> Self {
+    pub fn command_channel_size(mut self, size: NonZeroUsize) -> Self {
         self.command_channel_size = size;
         self
     }
 
     /// Set a custom notification channel size (default: 4096)
     #[inline]
-    pub fn notification_channel_size(mut self, size: usize) -> Self {
+    pub fn notification_channel_size(mut self, size: NonZeroUsize) -> Self {
         self.notification_channel_size = size;
         self
     }
