@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use bdk_core::bitcoin::Network;
@@ -15,8 +16,8 @@ async fn main() {
 
     // Connect to Electrum server
     let addr = ElectrumServerAddress::parse("ssl://mempool.space:40002").unwrap();
-    let electrum_client = ElectrumClient::new(addr);
-    let client = BdkElectrumClient::new(electrum_client);
+    let client = ElectrumClient::new(addr);
+    let client = BdkElectrumClient::new(Arc::new(client));
 
     // Connect
     client.connect();

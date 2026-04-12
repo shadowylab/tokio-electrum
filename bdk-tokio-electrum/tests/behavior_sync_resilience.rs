@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bdk_core::bitcoin::{Amount, ScriptBuf};
@@ -45,10 +46,10 @@ async fn wait_connected(client: &BdkElectrumClient) {
 async fn connected_bdk_client(env: &TestEnv) -> BdkElectrumClient {
     let addr = ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url))
         .expect("valid test electrum address");
-    let inner = ElectrumClientBuilder::new(addr)
+    let client = ElectrumClientBuilder::new(addr)
         .request_timeout(Duration::from_secs(2))
         .build();
-    let client = BdkElectrumClient::new(inner);
+    let client = BdkElectrumClient::new(Arc::new(client));
     client.connect();
     wait_connected(&client).await;
     client

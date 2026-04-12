@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{fmt, io};
 
@@ -620,30 +620,19 @@ impl InnerClient {
     }
 }
 
+// The client MUST not impl Clone.
+// We rely on Drop for disconnection.
+// For who needs cloning, can wrap the client in an Arc.
 /// Electrum client
 #[derive(Debug)]
 pub struct ElectrumClient {
     inner: Arc<InnerClient>,
-    atomic_counter: Arc<AtomicUsize>,
-}
-
-impl Clone for ElectrumClient {
-    fn clone(&self) -> Self {
-        self.atomic_counter.fetch_add(1, Ordering::SeqCst);
-
-        Self {
-            inner: self.inner.clone(),
-            atomic_counter: self.atomic_counter.clone(),
-        }
-    }
 }
 
 impl Drop for ElectrumClient {
+    #[inline]
     fn drop(&mut self) {
-        // Shutdown exactly once when the last client handle is dropped.
-        if self.atomic_counter.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.disconnect();
-        }
+        self.disconnect();
     }
 }
 
@@ -682,7 +671,6 @@ impl ElectrumClient {
                     expected_network: builder.expected_network,
                 },
             }),
-            atomic_counter: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -1387,25 +1375,7 @@ mod tests {
             assert!(client.is_running());
 
             // Clone the inner client
-            let inner: Arc<InnerClient> = client.inner.clone();
-
-            {
-                let c2: ElectrumClient = client.clone();
-                tokio::spawn(async move {
-                    assert_eq!(c2.atomic_counter.load(Ordering::SeqCst), 2);
-
-                    time::sleep(Duration::from_secs(1)).await;
-
-                    // c2 dropped here
-                });
-            }
-
-            time::sleep(Duration::from_secs(3)).await;
-
-            assert!(client.is_running());
-            assert_eq!(client.atomic_counter.load(Ordering::SeqCst), 1);
-
-            inner
+            client.inner.clone()
         }; // client dropped here
 
         time::sleep(Duration::from_secs(1)).await;

@@ -148,7 +148,7 @@ where
 #[derive(Debug, Clone)]
 pub struct BdkElectrumClient {
     /// The underlying electrum client.
-    inner: ElectrumClient,
+    inner: Arc<ElectrumClient>,
     /// The transaction cache
     tx_cache: Arc<RwLock<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
@@ -165,7 +165,7 @@ impl Deref for BdkElectrumClient {
 
 impl BdkElectrumClient {
     /// Creates a new bdk client from an electrum client
-    pub fn new(client: ElectrumClient) -> Self {
+    pub fn new(client: Arc<ElectrumClient>) -> Self {
         Self {
             inner: client,
             tx_cache: Default::default(),
@@ -1215,11 +1215,11 @@ mod tests {
 
     fn test_bdk_client() -> BdkElectrumClient {
         let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
-        BdkElectrumClient::new(
+        BdkElectrumClient::new(Arc::new(
             ElectrumClient::builder(addr)
                 .request_timeout(Duration::from_secs(2))
                 .build(),
-        )
+        ))
     }
 
     fn ctx_for_request(request: FullScanRequest<String>) -> SubscriptionCtx<String> {
@@ -1893,7 +1893,7 @@ mod tests {
         client.connect();
         wait_connected(&client).await;
 
-        let bdk_client = BdkElectrumClient::new(client);
+        let bdk_client = BdkElectrumClient::new(Arc::new(client));
 
         let prev_tip = CheckPoint::new(BlockId {
             height: 1_000,
@@ -1926,7 +1926,7 @@ mod tests {
         client.connect();
         wait_connected(&client).await;
 
-        let bdk_client = BdkElectrumClient::new(client);
+        let bdk_client = BdkElectrumClient::new(Arc::new(client));
 
         let wrong_prev_tip = CheckPoint::new(BlockId {
             height: 0,
@@ -1949,8 +1949,8 @@ mod tests {
     async fn connected_bdk_client(env: &TestEnv) -> BdkElectrumClient {
         let addr =
             ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
-        let inner = ElectrumClient::new(addr);
-        let client = BdkElectrumClient::new(inner);
+        let client = ElectrumClient::new(addr);
+        let client = BdkElectrumClient::new(Arc::new(client));
         client.connect();
         wait_connected(&client).await;
         client
@@ -1962,10 +1962,10 @@ mod tests {
     ) -> BdkElectrumClient {
         let addr =
             ElectrumServerAddress::parse(&format!("tcp://{}", env.electrsd.electrum_url)).unwrap();
-        let inner = ElectrumClientBuilder::new(addr)
+        let client = ElectrumClientBuilder::new(addr)
             .notification_channel_size(notification_channel_size)
             .build();
-        let client = BdkElectrumClient::new(inner);
+        let client = BdkElectrumClient::new(Arc::new(client));
         client.connect();
         wait_connected(&client).await;
         client
