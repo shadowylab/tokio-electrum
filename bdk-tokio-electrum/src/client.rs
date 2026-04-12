@@ -6,20 +6,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bdk_core::bitcoin::block::Header;
-use bdk_core::bitcoin::{BlockHash, Transaction, Txid};
+use bdk_core::bitcoin::{BlockHash, OutPoint, Transaction, Txid};
 use bdk_core::spk_client::{FullScanRequest, FullScanResponse, SpkWithExpectedTxids, SyncResponse};
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 pub use tokio_electrum::client::{ElectrumClient, Error};
-use tokio_electrum::types::{BlockHeader, ElectrumScriptHash, TransactionMerkel};
+use tokio_electrum::types::{BlockHeader, BlockHeaders, ElectrumScriptHash, TransactionMerkel};
 
 use crate::accumulator::FullScanAccumulator;
 use crate::constant::{
-    CHAIN_SUFFIX_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_WINDOW, DEFAULT_STOP_GAP,
-    DEFAULT_WALLET_LABEL, INITIAL_SCAN_MERKLE_BATCH_SIZE, INITIAL_SCAN_TX_BATCH_SIZE,
+    BATCH_TRANSACTION_GET_SIZE, BATCH_TX_GET_MERKLE_SIZE, CHAIN_SUFFIX_LENGTH, DEFAULT_BATCH_SIZE,
+    DEFAULT_BATCH_WINDOW, DEFAULT_STOP_GAP, DEFAULT_WALLET_LABEL,
 };
 use crate::live_sync_engine::LiveSyncEngine;
 use crate::subscription::{ScriptSubscription, SubscriptionCtx, SubscriptionInit};
@@ -28,6 +28,11 @@ use crate::util::dedup_tx_update_txs;
 
 /// A stream that yields initial full-scan data and then real-time updates.
 pub type SubscribeStream<K> = BoxStream<'static, Result<SubscribeEvent<K>, Error>>;
+
+struct TipAndLatestBlocks {
+    tip: CheckPoint,
+    latest_blocks: BTreeMap<u32, BlockHash>,
+}
 
 pub(crate) struct SpkScanResult {
     pub(crate) last_active_index: Option<u32>,
@@ -147,7 +152,7 @@ pub struct BdkElectrumClient {
     /// The transaction cache
     tx_cache: Arc<RwLock<HashMap<Txid, Arc<Transaction>>>>,
     /// The header cache
-    block_header_cache: Arc<Mutex<HashMap<u32, Header>>>,
+    block_header_cache: Arc<RwLock<HashMap<u32, Header>>>,
 }
 
 impl Deref for BdkElectrumClient {
@@ -159,7 +164,7 @@ impl Deref for BdkElectrumClient {
 }
 
 impl BdkElectrumClient {
-    /// Creates a new bdk client from a [`electrum_client::ElectrumApi`]
+    /// Creates a new bdk client from an electrum client
     pub fn new(client: ElectrumClient) -> Self {
         Self {
             inner: client,
@@ -184,9 +189,6 @@ impl BdkElectrumClient {
         }
     }
 
-    /// Fetch transaction of given `txid`.
-    ///
-    /// If it hits the cache it will return the cached version and avoid making the request.
     async fn fetch_tx(&self, txid: Txid) -> Result<Arc<Transaction>, Error> {
         {
             let tx_cache = self.tx_cache.read().await;
@@ -205,36 +207,47 @@ impl BdkElectrumClient {
         Ok(tx)
     }
 
-    /// Fetch transactions for the given txids while leveraging the local cache.
-    async fn fetch_txs_cached<I>(&self, txids: I) -> Result<HashMap<Txid, Arc<Transaction>>, Error>
+    async fn fetch_txs<I>(&self, txids: I) -> Result<HashMap<Txid, Arc<Transaction>>, Error>
     where
         I: IntoIterator<Item = Txid>,
     {
         let mut output: HashMap<Txid, Arc<Transaction>> = HashMap::new();
-        let mut missing = Vec::new();
-        let mut seen = HashSet::new();
+        let mut missing: Vec<Txid> = Vec::new();
+        let mut seen: HashSet<Txid> = HashSet::new();
 
         {
             let tx_cache = self.tx_cache.read().await;
+
             for txid in txids.into_iter() {
                 if !seen.insert(txid) {
                     continue;
                 }
 
-                if let Some(tx) = tx_cache.get(&txid) {
-                    output.insert(txid, Arc::clone(tx));
-                } else {
-                    missing.push(txid);
+                match tx_cache.get(&txid) {
+                    Some(tx) => {
+                        output.insert(txid, Arc::clone(tx));
+                    }
+                    None => {
+                        missing.push(txid);
+                    }
                 }
             }
         }
 
         if !missing.is_empty() {
-            for txid_chunk in missing.chunks(INITIAL_SCAN_TX_BATCH_SIZE) {
-                let fetched = self
+            for txid_chunk in missing.chunks(BATCH_TRANSACTION_GET_SIZE) {
+                // Batch get transactions
+                let fetched: Vec<Transaction> = self
                     .inner
                     .batch_transaction_get(txid_chunk.iter().copied())
                     .await?;
+
+                // Skip acquiring write lock if there are no fetched transactions
+                if fetched.is_empty() {
+                    continue;
+                }
+
+                // Cache transactions
                 let mut tx_cache = self.tx_cache.write().await;
 
                 for tx in fetched {
@@ -247,6 +260,126 @@ impl BdkElectrumClient {
         }
 
         Ok(output)
+    }
+
+    /// Fetch previous transaction outputs for fee calculation.
+    ///
+    /// This method fetches the `TxOut`s of the previous transactions for all inputs
+    /// of relevant transactions in the tx_update. This data is needed to calculate
+    /// transaction fees. Coinbase transactions are skipped, and duplicate fetches
+    /// are avoided using a deduplication set.
+    async fn fetch_prev_txout(
+        &self,
+        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+    ) -> Result<(), Error> {
+        let mut seen: HashSet<Txid> = HashSet::new();
+
+        for tx in &tx_update.txs {
+            // Skip if it's a coinbase transaction OR if we've already seen this txid.
+            if tx.is_coinbase() || !seen.insert(tx.compute_txid()) {
+                continue;
+            }
+
+            for vin in &tx.input {
+                let outpoint: OutPoint = vin.previous_output;
+                let vout: usize = outpoint.vout as usize;
+
+                // Fetch the TX
+                let prev_tx = self.fetch_tx(outpoint.txid).await?;
+
+                match prev_tx.output.get(vout) {
+                    Some(txout) => {
+                        tx_update.txouts.insert(outpoint, txout.clone());
+                    }
+                    None => {
+                        tracing::warn!(
+                            txid = %outpoint.txid,
+                            vout,
+                            "Skipping prevout fetch because vout is out of bounds for previous transaction."
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a merkle proof and insert a confirmation anchor when valid.
+    async fn validate_and_insert_anchor_from_merkle(
+        &self,
+        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+        txid: Txid,
+        merkle_res: TransactionMerkel,
+    ) -> Result<bool, Error> {
+        let confirmation_height: u32 = merkle_res.block_height.to_consensus_u32();
+
+        let mut header: Header = self.fetch_header(confirmation_height, false).await?;
+
+        let mut is_confirmed_tx: bool =
+            util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
+
+        // Merkle validation will fail if the header in `block_header_cache` is outdated, so we
+        // want to check if there is a new header and validate against the new one.
+        if !is_confirmed_tx {
+            header = self.fetch_header(confirmation_height, true).await?;
+            is_confirmed_tx = util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
+        }
+
+        if is_confirmed_tx {
+            tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    confirmation_time: header.time as u64,
+                    block_id: BlockId {
+                        height: confirmation_height,
+                        hash: header.block_hash(),
+                    },
+                },
+                txid,
+            ));
+            return Ok(true);
+        }
+
+        tracing::debug!(
+            txid = %txid,
+            confirmation_height,
+            "Merkle proof validation failed for confirmed tx."
+        );
+
+        Ok(false)
+    }
+
+    /// Validate a transaction's merkle proof and add an anchor if confirmed.
+    ///
+    /// This method fetches the merkle proof for the transaction, validates it against
+    /// the block header's merkle root, and adds a confirmation anchor to the tx_update
+    /// if the transaction is confirmed. If the cached header is outdated, it will fetch
+    /// a fresh header and retry validation.
+    async fn fetch_and_validate_merkle_for_anchor(
+        &self,
+        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
+        txid: Txid,
+        confirmation_height: u32,
+    ) -> Result<bool, Error> {
+        match self
+            .inner
+            .transaction_get_merkle(txid, confirmation_height)
+            .await
+        {
+            Ok(merkle) => {
+                self.validate_and_insert_anchor_from_merkle(tx_update, txid, merkle)
+                    .await
+            }
+            Err(e) => {
+                tracing::debug!(
+                    txid = %txid,
+                    confirmation_height,
+                    error = %e,
+                    "Could not fetch merkle proof for confirmed tx yet."
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Prefetch merkle proofs for confirmed transactions and cache anchor results for reuse.
@@ -265,7 +398,7 @@ impl BdkElectrumClient {
             }
         }
 
-        for pair_chunk in unique.chunks(INITIAL_SCAN_MERKLE_BATCH_SIZE) {
+        for pair_chunk in unique.chunks(BATCH_TX_GET_MERKLE_SIZE) {
             let responses = self
                 .inner
                 .batch_transaction_get_merkle(pair_chunk.iter().copied())
@@ -275,9 +408,10 @@ impl BdkElectrumClient {
             {
                 match merkle_res {
                     Ok(merkle) => {
-                        let anchored = self
+                        let anchored: bool = self
                             .validate_and_insert_anchor_from_merkle(tx_update, txid, merkle)
                             .await?;
+
                         if anchored {
                             cached.insert((txid, requested_height), true);
                         }
@@ -300,26 +434,146 @@ impl BdkElectrumClient {
     /// Fetch block header of given `height`.
     ///
     /// If it hits the cache it will return the cached version and avoid making the request.
-    async fn fetch_header(&self, height: u32) -> Result<Header, Error> {
-        let block_header_cache = self.block_header_cache.lock().await;
+    async fn fetch_header(&self, height: u32, skip_cache: bool) -> Result<Header, Error> {
+        if !skip_cache {
+            let block_header_cache = self.block_header_cache.read().await;
 
-        if let Some(header) = block_header_cache.get(&height) {
-            return Ok(*header);
+            if let Some(header) = block_header_cache.get(&height) {
+                return Ok(*header);
+            }
         }
 
-        drop(block_header_cache);
+        // Fetch the block header
+        let header: Header = self.inner.block_header(height).await?;
 
-        self.update_header(height).await
-    }
-
-    /// Update a block header at given `height`. Returns the updated header.
-    async fn update_header(&self, height: u32) -> Result<Header, Error> {
-        let header = self.inner.block_header(height).await?;
-
-        let mut block_header_cache = self.block_header_cache.lock().await;
+        // Cache it
+        let mut block_header_cache = self.block_header_cache.write().await;
         block_header_cache.insert(height, header);
 
         Ok(header)
+    }
+
+    async fn fetch_latest_block_hashes(
+        &self,
+        tip_height: u32,
+        wallet_label: &str,
+    ) -> Result<BTreeMap<u32, BlockHash>, Error> {
+        let start_height: u32 = tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
+
+        tracing::info!(
+            wallet = %wallet_label,
+            "Retrieving block headers.",
+        );
+
+        // Fetch the block headers from the timechain
+        let block_headers: BlockHeaders = self
+            .inner
+            .block_headers(start_height, CHAIN_SUFFIX_LENGTH as usize)
+            .await?;
+
+        let mut height: u32 = start_height;
+        let mut hashes: BTreeMap<u32, BlockHash> = BTreeMap::new();
+
+        for header in block_headers.headers {
+            hashes.insert(height, header.block_hash());
+            height += 1;
+        }
+
+        Ok(hashes)
+    }
+
+    // Find the "point of agreement" (if any).
+    async fn find_checkpoint_of_agreement(
+        &self,
+        prev_tip: CheckPoint,
+        new_tip_height: u32,
+        new_blocks: &mut BTreeMap<u32, BlockHash>,
+    ) -> Result<Option<CheckPoint>, Error> {
+        let mut agreement_cp: Option<CheckPoint> = None;
+
+        for cp in prev_tip.iter() {
+            let cp_block = cp.block_id();
+
+            let hash: BlockHash = match new_blocks.get(&cp_block.height) {
+                Some(&hash) => hash,
+                None => {
+                    assert!(
+                        new_tip_height >= cp_block.height,
+                        "already checked that electrum's tip cannot be smaller"
+                    );
+
+                    let hash: BlockHash =
+                        self.inner.block_header(cp_block.height).await?.block_hash();
+
+                    new_blocks.insert(cp_block.height, hash);
+
+                    hash
+                }
+            };
+
+            if hash == cp_block.hash {
+                agreement_cp = Some(cp);
+                break;
+            }
+        }
+
+        Ok(agreement_cp)
+    }
+
+    async fn fetch_tip_and_latest_blocks(
+        &self,
+        wallet_label: &str,
+        prev_tip: CheckPoint,
+    ) -> Result<TipAndLatestBlocks, Error> {
+        // Get chain tip
+        let BlockHeader {
+            height: new_tip_height,
+            ..
+        } = self.get_tip().await?;
+
+        // If electrum returns a tip height that is lower than our previous tip, then checkpoints do
+        // not need updating. We just return the previous tip and use that as the point of agreement.
+        if new_tip_height < prev_tip.height() {
+            return Ok(TipAndLatestBlocks {
+                tip: prev_tip,
+                latest_blocks: BTreeMap::new(),
+            });
+        }
+
+        let mut new_blocks: BTreeMap<u32, BlockHash> = self
+            .fetch_latest_block_hashes(new_tip_height, wallet_label)
+            .await?;
+
+        // Find the "point of agreement" (if any).
+        let agreement_cp: Option<CheckPoint> = self
+            .find_checkpoint_of_agreement(prev_tip, new_tip_height, &mut new_blocks)
+            .await?;
+        let agreement_height: Option<u32> = agreement_cp.as_ref().map(CheckPoint::height);
+
+        // Prune `new_blocks` to only include blocks that are actually new.
+        new_blocks.retain(|height, _| Some(*height) > agreement_height);
+
+        // Find new tip
+        let mut new_tip: Option<CheckPoint> = agreement_cp;
+
+        for (height, hash) in new_blocks.iter() {
+            let block = BlockId {
+                height: *height,
+                hash: *hash,
+            };
+
+            new_tip = Some(match new_tip {
+                Some(cp) => cp.push(block).expect("must extend checkpoint"),
+                None => CheckPoint::new(block),
+            });
+        }
+
+        let new_tip: CheckPoint = new_tip.expect("must have at least one checkpoint");
+
+        Ok(TipAndLatestBlocks {
+            tip: new_tip,
+            latest_blocks: new_blocks,
+        })
     }
 
     /// Run initial full scan and build subscription bootstrap state for live updates.
@@ -334,17 +588,18 @@ impl BdkElectrumClient {
     where
         K: Ord + Clone + Display,
     {
-        let start_time = request.start_time();
+        let start_time: u64 = request.start_time();
 
-        let tip_and_latest_blocks = match request.chain_tip() {
-            Some(chain_tip) => {
-                Some(fetch_tip_and_latest_blocks(wallet_label, &self.inner, chain_tip).await?)
-            }
+        let tip_and_latest_blocks: Option<TipAndLatestBlocks> = match request.chain_tip() {
+            Some(chain_tip) => Some(
+                self.fetch_tip_and_latest_blocks(wallet_label, chain_tip)
+                    .await?,
+            ),
             None => None,
         };
 
         let mut tx_update: TxUpdate<ConfirmationBlockTime> = TxUpdate::default();
-        let mut scan_accumulator = FullScanAccumulator::new();
+        let mut scan_accumulator: FullScanAccumulator<K> = FullScanAccumulator::new();
 
         for keychain in request.keychains() {
             let spks = request
@@ -373,13 +628,12 @@ impl BdkElectrumClient {
             self.fetch_prev_txout(&mut tx_update).await?;
         }
 
-        let chain_update = match tip_and_latest_blocks {
-            Some((chain_tip, latest_blocks)) => Some(chain_update(
-                chain_tip,
-                &latest_blocks,
+        let chain_update: Option<CheckPoint> = match tip_and_latest_blocks {
+            Some(tip_and_latest_blocks) => Some(chain_update(
+                tip_and_latest_blocks,
                 tx_update.anchors.iter().cloned(),
             )?),
-            _ => None,
+            None => None,
         };
 
         let (last_active_indices, subscription_init) = scan_accumulator.into_subscription_init();
@@ -626,7 +880,7 @@ impl BdkElectrumClient {
                 if is_new_tx || status_changed {
                     let anchored = match electrum_height.try_into() {
                         Ok(height) if height > 0 => {
-                            self.validate_merkle_for_anchor(&mut tx_update, txid, height)
+                            self.fetch_and_validate_merkle_for_anchor(&mut tx_update, txid, height)
                                 .await?
                         }
                         _ => false,
@@ -722,7 +976,7 @@ impl BdkElectrumClient {
                 .iter()
                 .flat_map(|history| history.iter().map(|res| res.txid()))
                 .collect();
-            let txs_by_id = self.fetch_txs_cached(batch_txids).await?;
+            let txs_by_id = self.fetch_txs(batch_txids).await?;
             let confirmed_pairs: Vec<(Txid, u32)> = spk_histories
                 .iter()
                 .flat_map(|history| {
@@ -788,7 +1042,7 @@ impl BdkElectrumClient {
                         Ok(height) if height > 0 => match prefetched_anchors.get(&(txid, height)) {
                             Some(anchored) => *anchored,
                             None => {
-                                self.validate_merkle_for_anchor(tx_update, txid, height)
+                                self.fetch_and_validate_merkle_for_anchor(tx_update, txid, height)
                                     .await?
                             }
                         },
@@ -851,203 +1105,12 @@ impl BdkElectrumClient {
 
         Ok(())
     }
-
-    /// Validate a transaction's merkle proof and add an anchor if confirmed.
-    ///
-    /// This method fetches the merkle proof for the transaction, validates it against
-    /// the block header's merkle root, and adds a confirmation anchor to the tx_update
-    /// if the transaction is confirmed. If the cached header is outdated, it will fetch
-    /// a fresh header and retry validation.
-    async fn validate_merkle_for_anchor(
-        &self,
-        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-        txid: Txid,
-        confirmation_height: u32,
-    ) -> Result<bool, Error> {
-        let merkle_res = match self
-            .inner
-            .transaction_get_merkle(txid, confirmation_height)
-            .await
-        {
-            Ok(merkle) => merkle,
-            Err(e) => {
-                tracing::debug!(
-                    txid = %txid,
-                    confirmation_height,
-                    error = %e,
-                    "Could not fetch merkle proof for confirmed tx yet."
-                );
-                return Ok(false);
-            }
-        };
-
-        self.validate_and_insert_anchor_from_merkle(tx_update, txid, merkle_res)
-            .await
-    }
-
-    /// Validate a merkle proof and insert a confirmation anchor when valid.
-    async fn validate_and_insert_anchor_from_merkle(
-        &self,
-        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-        txid: Txid,
-        merkle_res: TransactionMerkel,
-    ) -> Result<bool, Error> {
-        let confirmation_height = merkle_res.block_height.to_consensus_u32();
-        let mut header = self.fetch_header(confirmation_height).await?;
-        let mut is_confirmed_tx =
-            util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
-
-        // Merkle validation will fail if the header in `block_header_cache` is outdated, so we
-        // want to check if there is a new header and validate against the new one.
-        if !is_confirmed_tx {
-            header = self.update_header(confirmation_height).await?;
-            is_confirmed_tx = util::validate_merkle_proof(&txid, &header.merkle_root, &merkle_res);
-        }
-
-        if is_confirmed_tx {
-            tx_update.anchors.insert((
-                ConfirmationBlockTime {
-                    confirmation_time: header.time as u64,
-                    block_id: BlockId {
-                        height: confirmation_height,
-                        hash: header.block_hash(),
-                    },
-                },
-                txid,
-            ));
-            return Ok(true);
-        }
-
-        tracing::debug!(
-            txid = %txid,
-            confirmation_height,
-            "Merkle proof validation failed for confirmed tx."
-        );
-
-        Ok(false)
-    }
-
-    /// Fetch previous transaction outputs for fee calculation.
-    ///
-    /// This method fetches the `TxOut`s of the previous transactions for all inputs
-    /// of relevant transactions in the tx_update. This data is needed to calculate
-    /// transaction fees. Coinbase transactions are skipped, and duplicate fetches
-    /// are avoided using a deduplication set.
-    async fn fetch_prev_txout(
-        &self,
-        tx_update: &mut TxUpdate<ConfirmationBlockTime>,
-    ) -> Result<(), Error> {
-        let mut no_dup = HashSet::<Txid>::new();
-        for tx in &tx_update.txs {
-            if !tx.is_coinbase() && no_dup.insert(tx.compute_txid()) {
-                for vin in &tx.input {
-                    let outpoint = vin.previous_output;
-                    let vout = outpoint.vout;
-                    let prev_tx = self.fetch_tx(outpoint.txid).await?;
-                    if let Some(txout) = prev_tx.output.get(vout as usize).cloned() {
-                        let _ = tx_update.txouts.insert(outpoint, txout);
-                    } else {
-                        tracing::warn!(
-                            txid = %outpoint.txid,
-                            vout,
-                            "Skipping prevout fetch because vout is out of bounds for previous transaction."
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Default)]
 pub(crate) struct ProcessedScriptBatch {
     pub(crate) tx_update: TxUpdate<ConfirmationBlockTime>,
     pub(crate) hashes_with_new_txs: Vec<ElectrumScriptHash>,
-}
-
-/// Return a [`CheckPoint`] of the latest tip, that connects with `prev_tip`. The latest blocks are
-/// fetched to construct checkpoint updates with the proper [`BlockHash`] in case of re-org.
-async fn fetch_tip_and_latest_blocks(
-    wallet_label: &str,
-    client: &ElectrumClient,
-    prev_tip: CheckPoint,
-) -> Result<(CheckPoint, BTreeMap<u32, BlockHash>), Error> {
-    let BlockHeader {
-        height: new_tip_height,
-        ..
-    } = client.get_tip().await?;
-
-    // If electrum returns a tip height that is lower than our previous tip, then checkpoints do
-    // not need updating. We just return the previous tip and use that as the point of agreement.
-    if new_tip_height < prev_tip.height() {
-        return Ok((prev_tip, BTreeMap::new()));
-    }
-
-    // Atomically fetch the latest `CHAIN_SUFFIX_LENGTH` count of blocks from Electrum. We use this
-    // to construct our checkpoint update.
-    let mut new_blocks = {
-        let start_height = new_tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
-        tracing::info!(
-            wallet = %wallet_label,
-            "Retrieving block headers.",
-        );
-        let hashes = client
-            .block_headers(start_height as _, CHAIN_SUFFIX_LENGTH as _)
-            .await?
-            .headers
-            .into_iter()
-            .map(|h| h.block_hash());
-        (start_height..).zip(hashes).collect::<BTreeMap<u32, _>>()
-    };
-
-    // Find the "point of agreement" (if any).
-    let agreement_cp = {
-        let mut agreement_cp = Option::<CheckPoint>::None;
-        for cp in prev_tip.iter() {
-            let cp_block = cp.block_id();
-            let hash = match new_blocks.get(&cp_block.height) {
-                Some(&hash) => hash,
-                None => {
-                    assert!(
-                        new_tip_height >= cp_block.height,
-                        "already checked that electrum's tip cannot be smaller"
-                    );
-                    let hash = client
-                        .block_header(cp_block.height as _)
-                        .await?
-                        .block_hash();
-                    new_blocks.insert(cp_block.height, hash);
-                    hash
-                }
-            };
-            if hash == cp_block.hash {
-                agreement_cp = Some(cp);
-                break;
-            }
-        }
-        agreement_cp
-    };
-
-    let agreement_height = agreement_cp.as_ref().map(CheckPoint::height);
-
-    let new_tip = new_blocks
-        .iter()
-        // Prune `new_blocks` to only include blocks that are actually new.
-        .filter(|(height, _)| Some(**height) > agreement_height)
-        .map(|(height, hash)| BlockId {
-            height: *height,
-            hash: *hash,
-        })
-        .fold(agreement_cp, |prev_cp, block| {
-            Some(match prev_cp {
-                Some(cp) => cp.push(block).expect("must extend checkpoint"),
-                None => CheckPoint::new(block),
-            })
-        })
-        .expect("must have at least one checkpoint");
-
-    Ok((new_tip, new_blocks))
 }
 
 fn apply_confirmation_tracking(
@@ -1071,23 +1134,26 @@ fn apply_confirmation_tracking(
 // Add a corresponding checkpoint per anchor height if it does not yet exist. Checkpoints should not
 // surpass `latest_blocks`.
 fn chain_update(
-    mut tip: CheckPoint,
-    latest_blocks: &BTreeMap<u32, BlockHash>,
+    tip_and_latest_blocks: TipAndLatestBlocks,
     anchors: impl Iterator<Item = (ConfirmationBlockTime, Txid)>,
 ) -> Result<CheckPoint, Error> {
-    for (anchor, _txid) in anchors {
+    let mut tip: CheckPoint = tip_and_latest_blocks.tip;
+    let latest_blocks: BTreeMap<u32, BlockHash> = tip_and_latest_blocks.latest_blocks;
+
+    for (anchor, ..) in anchors {
         let height = anchor.block_id.height;
 
         // Checkpoint uses the `BlockHash` from `latest_blocks` so that the hash will be consistent
         // in case of a re-org.
         if tip.get(height).is_none() && height <= tip.height() {
-            let hash = match latest_blocks.get(&height) {
+            let hash: BlockHash = match latest_blocks.get(&height) {
                 Some(&hash) => hash,
                 None => anchor.block_id.hash,
             };
             tip = tip.insert(BlockId { hash, height });
         }
     }
+
     Ok(tip)
 }
 
@@ -1108,6 +1174,7 @@ mod tests {
     use bdk_core::{BlockId, CheckPoint};
     use futures_util::StreamExt;
     use testenv::TestEnv;
+    use tokio::sync::Mutex;
     use tokio::time::{sleep, timeout};
     use tokio_electrum::address::ElectrumServerAddress;
     use tokio_electrum::builder::ElectrumClientBuilder;
@@ -1263,7 +1330,11 @@ mod tests {
             ),
         ];
 
-        let updated = chain_update(tip, &latest_blocks, anchors.into_iter()).unwrap();
+        let tip_and_latest_blocks = TipAndLatestBlocks {
+            tip,
+            latest_blocks: latest_blocks.clone(),
+        };
+        let updated = chain_update(tip_and_latest_blocks, anchors.into_iter()).unwrap();
         let cp4 = updated
             .get(4)
             .expect("checkpoint at anchor height should be inserted");
@@ -1469,11 +1540,11 @@ mod tests {
         let header = genesis_block(Network::Regtest).header;
 
         {
-            let mut cache = client.block_header_cache.lock().await;
+            let mut cache = client.block_header_cache.write().await;
             cache.insert(42, header);
         }
 
-        let fetched = client.fetch_header(42).await.unwrap();
+        let fetched = client.fetch_header(42, false).await.unwrap();
         assert_eq!(fetched, header);
     }
 
@@ -1805,7 +1876,11 @@ mod tests {
             txid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         )];
 
-        let updated = chain_update(tip, &BTreeMap::new(), anchors.into_iter()).unwrap();
+        let tip_and_latest_blocks = TipAndLatestBlocks {
+            tip,
+            latest_blocks: BTreeMap::new(),
+        };
+        let updated = chain_update(tip_and_latest_blocks, anchors.into_iter()).unwrap();
         assert_eq!(updated.get(4).unwrap().block_id().hash, anchor_hash);
     }
 
@@ -1818,17 +1893,20 @@ mod tests {
         client.connect();
         wait_connected(&client).await;
 
+        let bdk_client = BdkElectrumClient::new(client);
+
         let prev_tip = CheckPoint::new(BlockId {
             height: 1_000,
             hash: hash("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
         });
-        let (tip, latest) = fetch_tip_and_latest_blocks("test-wallet", &client, prev_tip.clone())
+        let TipAndLatestBlocks { tip, latest_blocks } = bdk_client
+            .fetch_tip_and_latest_blocks("test-wallet", prev_tip.clone())
             .await
             .unwrap();
 
         assert_eq!(tip, prev_tip);
-        assert!(latest.is_empty());
-        client.disconnect();
+        assert!(latest_blocks.is_empty());
+        bdk_client.disconnect();
     }
 
     #[tokio::test]
@@ -1848,21 +1926,24 @@ mod tests {
         client.connect();
         wait_connected(&client).await;
 
+        let bdk_client = BdkElectrumClient::new(client);
+
         let wrong_prev_tip = CheckPoint::new(BlockId {
             height: 0,
             hash: hash("abababababababababababababababababababababababababababababababab"),
         });
 
-        let (tip, latest) = fetch_tip_and_latest_blocks("test-wallet", &client, wrong_prev_tip)
+        let TipAndLatestBlocks { tip, latest_blocks } = bdk_client
+            .fetch_tip_and_latest_blocks("test-wallet", wrong_prev_tip)
             .await
             .unwrap();
 
         assert!(tip.height() > 0, "expected reconstructed tip from electrum");
         assert!(
-            !latest.is_empty(),
+            !latest_blocks.is_empty(),
             "expected latest block map to be populated"
         );
-        client.disconnect();
+        bdk_client.disconnect();
     }
 
     async fn connected_bdk_client(env: &TestEnv) -> BdkElectrumClient {
