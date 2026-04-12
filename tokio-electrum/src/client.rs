@@ -886,15 +886,36 @@ impl ElectrumClient {
     }
 
     /// Unsubscribe from a script hash
+    #[inline]
     pub async fn script_hash_unsubscribe<T>(&self, script_hash: T) -> Result<(), Error>
     where
         T: Into<ElectrumScriptHash>,
     {
+        self.batch_script_hash_unsubscribe(vec![script_hash]).await
+    }
+
+    /// Unsubscribe from script hashes
+    pub async fn batch_script_hash_unsubscribe<I, T>(&self, script_hashes: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<ElectrumScriptHash>,
+    {
         let mut batch = AsyncBatchRequest::new();
-        batch.event_request(ScriptHashUnsubscribe {
-            script_hash: script_hash.into(),
-        });
+        let mut has_requests = false;
+
+        for script_hash in script_hashes {
+            has_requests = true;
+            batch.event_request(ScriptHashUnsubscribe {
+                script_hash: script_hash.into(),
+            });
+        }
+
+        if !has_requests {
+            return Ok(());
+        }
+
         self.inner.send_batch(batch).await?;
+
         Ok(())
     }
 
