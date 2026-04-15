@@ -646,6 +646,8 @@ pub struct ElectrumClient {
 impl Drop for ElectrumClient {
     #[inline]
     fn drop(&mut self) {
+        tracing::debug!(addr = %self.inner.addr, "Dropping electrum client..");
+
         self.disconnect();
     }
 }
