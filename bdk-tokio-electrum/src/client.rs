@@ -14,7 +14,9 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use tokio::sync::RwLock;
 pub use tokio_electrum::client::{ElectrumClient, Error};
-use tokio_electrum::types::{BlockHeader, BlockHeaders, ElectrumScriptHash, TransactionMerkel};
+use tokio_electrum::types::{
+    BlockHeader, BlockHeaders, ElectrumScriptHash, ElectrumScriptStatus, TransactionMerkel,
+};
 
 use crate::accumulator::FullScanAccumulator;
 use crate::constant::{
@@ -49,7 +51,7 @@ pub enum SubscribeEvent<K> {
     Initial(FullScanResponse<K>),
     /// Incremental update emitted for script hash and header notifications.
     Update(SyncResponse<ConfirmationBlockTime>),
-    /// Connection has been disconnected and the stream will terminate.
+    /// Stream has been terminated (for example client shutdown).
     Disconnected,
 }
 
@@ -653,7 +655,7 @@ impl BdkElectrumClient {
     ///
     /// The returned stream first yields [`SubscribeEvent::Initial`] with the complete
     /// [`FullScanResponse`], then yields batched [`SubscribeEvent::Update`] values.
-    /// On disconnection, it yields [`SubscribeEvent::Disconnected`] and then terminates.
+    /// On terminal shutdown, it yields [`SubscribeEvent::Disconnected`] and then terminates.
     #[inline]
     pub fn sync<K, R>(&self, request: R) -> SyncWallet<'_, K>
     where
@@ -843,15 +845,18 @@ impl BdkElectrumClient {
 
         let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
         let mut hashes_with_new_txs = Vec::new();
-        let mut next_expected_updates = Vec::new();
+        let mut next_subscription_updates = Vec::new();
 
         for ((script_hash, expected_tx_heights), history) in tracked.into_iter().zip(histories) {
             let current_tx_heights: HashMap<Txid, i64> = history
                 .iter()
                 .map(|tx| (tx.txid(), tx.electrum_height()))
                 .collect();
+            let current_status: Option<ElectrumScriptStatus> =
+                ElectrumScriptStatus::from_history(&history);
 
             if current_tx_heights == expected_tx_heights {
+                next_subscription_updates.push((script_hash, expected_tx_heights, current_status));
                 continue;
             }
 
@@ -899,18 +904,19 @@ impl BdkElectrumClient {
             if has_new_txs {
                 hashes_with_new_txs.push(script_hash);
             }
-            next_expected_updates.push((script_hash, next_expected_tx_heights));
+            next_subscription_updates.push((script_hash, next_expected_tx_heights, current_status));
         }
 
         if fetch_prev_txouts && !tx_update.txs.is_empty() {
             self.fetch_prev_txout(&mut tx_update).await?;
         }
 
-        if !next_expected_updates.is_empty() {
+        if !next_subscription_updates.is_empty() {
             let mut state = ctx.state.lock().await;
-            for (script_hash, next_expected_tx_heights) in next_expected_updates {
+            for (script_hash, next_expected_tx_heights, next_status) in next_subscription_updates {
                 if let Some(subscription) = state.script_subscriptions.get_mut(&script_hash) {
                     subscription.expected_tx_heights = next_expected_tx_heights;
+                    subscription.last_status = next_status;
                 }
             }
         }
@@ -1003,6 +1009,8 @@ impl BdkElectrumClient {
                     .iter()
                     .map(|res| (res.txid(), res.electrum_height()))
                     .collect();
+                let script_status: Option<ElectrumScriptStatus> =
+                    ElectrumScriptStatus::from_history(&spk_history);
                 let spk_history_txids: HashSet<Txid> =
                     spk_history_heights.keys().copied().collect();
                 let script_hash = ElectrumScriptHash::new(&spk.spk);
@@ -1061,7 +1069,7 @@ impl BdkElectrumClient {
                 scripts_to_subscribe.push((
                     script_hash,
                     spk_index,
-                    ScriptSubscription::new(spk_history_heights),
+                    ScriptSubscription::with_status(spk_history_heights, script_status),
                 ));
             }
 

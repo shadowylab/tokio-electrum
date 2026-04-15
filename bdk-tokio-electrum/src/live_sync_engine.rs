@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Instant, timeout_at};
 use tokio_electrum::client::Error;
 use tokio_electrum::notification::ElectrumNotification;
-use tokio_electrum::prelude::ElectrumScriptHash;
+use tokio_electrum::prelude::{ElectrumScriptHash, ElectrumScriptStatus};
 
 use crate::client::{BdkElectrumClient, SubscribeEvent, SubscribeStream};
 use crate::constant::LIVE_SYNC_HISTORY_BATCH_SIZE;
@@ -21,22 +21,28 @@ use crate::util::dedup_tx_update_txs;
 
 #[derive(Default)]
 struct PendingBatch {
-    dirty_scripts: HashSet<ElectrumScriptHash>,
+    script_statuses: HashMap<ElectrumScriptHash, Option<ElectrumScriptStatus>>,
     latest_header: Option<(u32, Header)>,
     lagged: bool,
-    disconnected: bool,
+    reconnected: bool,
+    terminal_disconnect: bool,
 }
 
 impl PendingBatch {
     fn has_work(&self) -> bool {
-        self.lagged || !self.dirty_scripts.is_empty() || self.latest_header.is_some()
+        self.lagged
+            || self.reconnected
+            || self.terminal_disconnect
+            || !self.script_statuses.is_empty()
+            || self.latest_header.is_some()
     }
 }
 
 struct LiveStreamState<K> {
     engine: LiveSyncEngine<K>,
     notification_rx: broadcast::Receiver<ElectrumNotification>,
-    pending_disconnect: bool,
+    is_connected: bool,
+    pending_terminal_disconnect: bool,
     done: bool,
 }
 
@@ -94,9 +100,10 @@ where
         notification_rx: broadcast::Receiver<ElectrumNotification>,
     ) -> SubscribeStream<K> {
         let initial_state = LiveStreamState {
+            is_connected: self.client.status().is_connected(),
             engine: self,
             notification_rx,
-            pending_disconnect: false,
+            pending_terminal_disconnect: false,
             done: false,
         };
 
@@ -105,8 +112,8 @@ where
                 return None;
             }
 
-            if state.pending_disconnect {
-                state.pending_disconnect = false;
+            if state.pending_terminal_disconnect {
+                state.pending_terminal_disconnect = false;
                 state.done = true;
                 return Some((Ok(SubscribeEvent::Disconnected), state));
             }
@@ -114,14 +121,14 @@ where
             loop {
                 let mut batch = state
                     .engine
-                    .next_pending_batch(&mut state.notification_rx)
+                    .next_pending_batch(&mut state.notification_rx, &mut state.is_connected)
                     .await;
                 match state.engine.build_sync_update_from_batch(&mut batch).await {
                     Ok(Some(update)) => {
-                        state.pending_disconnect = batch.disconnected;
+                        state.pending_terminal_disconnect = batch.terminal_disconnect;
                         return Some((Ok(SubscribeEvent::Update(update)), state));
                     }
-                    Ok(None) if batch.disconnected => {
+                    Ok(None) if batch.terminal_disconnect => {
                         state.done = true;
                         return Some((Ok(SubscribeEvent::Disconnected), state));
                     }
@@ -140,25 +147,28 @@ where
     async fn next_pending_batch(
         &self,
         notification_rx: &mut broadcast::Receiver<ElectrumNotification>,
+        is_connected: &mut bool,
     ) -> PendingBatch {
         let mut batch = PendingBatch::default();
 
         loop {
             let received = notification_rx.recv().await;
-            self.collect_batch_notification(received, &mut batch).await;
-            if batch.disconnected || batch.has_work() {
+            self.collect_batch_notification(received, &mut batch, is_connected)
+                .await;
+            if batch.has_work() {
                 break;
             }
         }
 
-        if batch.disconnected {
+        if batch.terminal_disconnect || batch.reconnected {
             return batch;
         }
 
         let deadline: Instant = Instant::now() + self.batch_window;
         while let Ok(received) = timeout_at(deadline, notification_rx.recv()).await {
-            self.collect_batch_notification(received, &mut batch).await;
-            if batch.disconnected {
+            self.collect_batch_notification(received, &mut batch, is_connected)
+                .await;
+            if batch.terminal_disconnect || batch.reconnected {
                 break;
             }
         }
@@ -170,23 +180,34 @@ where
         &self,
         received: Result<ElectrumNotification, broadcast::error::RecvError>,
         batch: &mut PendingBatch,
+        is_connected: &mut bool,
     ) {
         match received {
-            Ok(ElectrumNotification::ScriptHash { hash, .. }) => {
+            Ok(ElectrumNotification::ScriptHash { hash, status }) => {
                 if self.ctx.has_script(&hash).await {
-                    batch.dirty_scripts.insert(hash);
+                    batch.script_statuses.insert(hash, status);
                 }
             }
             Ok(ElectrumNotification::BlockHeader { height, header }) => {
                 batch.latest_header = Some((height, header));
             }
-            Ok(ElectrumNotification::ConnectionStatusChanged(status)) if !status.is_connected() => {
-                batch.disconnected = true;
+            Ok(ElectrumNotification::ConnectionStatusChanged(status)) => {
+                if status.is_connected() {
+                    if !*is_connected {
+                        tracing::info!(
+                            wallet = %self.ctx.wallet_label,
+                            "Electrum reconnected, starting incremental catch-up."
+                        );
+                        batch.reconnected = true;
+                    }
+                    *is_connected = true;
+                } else {
+                    *is_connected = false;
+                }
             }
             Ok(ElectrumNotification::Shutdown) => {
-                batch.disconnected = true;
+                batch.terminal_disconnect = true;
             }
-            Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(
                     wallet = %self.ctx.wallet_label,
@@ -196,7 +217,7 @@ where
                 batch.lagged = true;
             }
             Err(broadcast::error::RecvError::Closed) => {
-                batch.disconnected = true;
+                batch.terminal_disconnect = true;
             }
         }
     }
@@ -205,12 +226,14 @@ where
         &self,
         batch: &mut PendingBatch,
     ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error> {
+        self.reconcile_after_reconnect(batch).await?;
+
         let chain_update = self.apply_chain_tip_update_from_batch(batch).await;
         let scripts_to_process = self
             .scripts_to_process_for_batch(batch, chain_update.is_some())
             .await;
         let tx_update = self
-            .apply_script_updates_for_batch(scripts_to_process, batch)
+            .apply_script_updates_for_batch(scripts_to_process)
             .await?;
 
         if tx_update.is_empty() && chain_update.is_none() {
@@ -233,6 +256,35 @@ where
         }))
     }
 
+    async fn reconcile_after_reconnect(&self, batch: &mut PendingBatch) -> Result<(), Error> {
+        if !batch.reconnected {
+            return Ok(());
+        }
+
+        match self.client.get_tip().await {
+            Ok(tip) => {
+                batch.latest_header = Some((tip.height, tip.header));
+            }
+            Err(e) if e.is_disconnected_like() => return Ok(()),
+            Err(e) => return Err(e),
+        }
+
+        let tracked_hashes = self.ctx.tracked_script_hashes().await;
+        if tracked_hashes.is_empty() {
+            return Ok(());
+        }
+
+        match self
+            .client
+            .batch_script_hash_subscribe(tracked_hashes.iter().copied())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_disconnected_like() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn apply_chain_tip_update_from_batch(
         &self,
         batch: &mut PendingBatch,
@@ -253,7 +305,9 @@ where
         let mut scripts_to_process: Vec<ElectrumScriptHash> = if batch.lagged {
             self.ctx.tracked_script_hashes().await
         } else {
-            batch.dirty_scripts.drain().collect()
+            self.ctx
+                .script_hashes_with_status_changes(&batch.script_statuses)
+                .await
         };
         if include_pending_for_chain_tip {
             scripts_to_process.extend(self.ctx.script_hashes_with_unconfirmed_txs().await);
@@ -267,7 +321,6 @@ where
     async fn apply_script_updates_for_batch(
         &self,
         scripts_to_process: Vec<ElectrumScriptHash>,
-        batch: &mut PendingBatch,
     ) -> Result<TxUpdate<ConfirmationBlockTime>, Error> {
         let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
 
@@ -291,7 +344,6 @@ where
                     }
                 }
                 Err(e) if e.is_disconnected_like() => {
-                    batch.disconnected = true;
                     break;
                 }
                 Err(e) => return Err(e),
@@ -334,10 +386,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use bdk_core::bitcoin::Network;
     use bdk_core::bitcoin::constants::genesis_block;
     use bdk_core::spk_client::FullScanRequest;
     use tokio::sync::Mutex;
+    use tokio_electrum::address::ElectrumServerAddress;
+    use tokio_electrum::client::ElectrumClient;
+    use tokio_electrum::status::ElectrumConnectionStatus;
 
     use super::*;
     use crate::subscription::SubscriptionState;
@@ -349,6 +408,19 @@ mod tests {
             request: Mutex::new(request),
             state: Mutex::new(SubscriptionState::default()),
             chain_tip: Mutex::new(chain_tip),
+        }
+    }
+
+    fn make_engine(ctx: SubscriptionCtx<String>) -> LiveSyncEngine<String> {
+        let addr = ElectrumServerAddress::parse("tcp://127.0.0.1:50001").unwrap();
+        let client = BdkElectrumClient::new(Arc::new(ElectrumClient::builder(addr).build()));
+        LiveSyncEngine {
+            client,
+            ctx: Arc::new(ctx),
+            start_time: 0,
+            fetch_prev_txouts: false,
+            stop_gap: NonZeroU32::new(20).unwrap(),
+            batch_window: Duration::from_millis(250),
         }
     }
 
@@ -374,5 +446,48 @@ mod tests {
             .await
             .expect("expected update");
         assert_eq!(update.height(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_batch_notification_marks_reconnect_only_on_transition() {
+        let engine = make_engine(make_ctx(None));
+        let mut batch = PendingBatch::default();
+        let mut is_connected = false;
+
+        engine
+            .collect_batch_notification(
+                Ok(ElectrumNotification::ConnectionStatusChanged(
+                    ElectrumConnectionStatus::Connected,
+                )),
+                &mut batch,
+                &mut is_connected,
+            )
+            .await;
+
+        assert!(is_connected);
+        assert!(batch.reconnected);
+        assert!(!batch.terminal_disconnect);
+    }
+
+    #[tokio::test]
+    async fn collect_batch_notification_ignores_transient_disconnect_for_stream_shutdown() {
+        let engine = make_engine(make_ctx(None));
+        let mut batch = PendingBatch::default();
+        let mut is_connected = true;
+
+        engine
+            .collect_batch_notification(
+                Ok(ElectrumNotification::ConnectionStatusChanged(
+                    ElectrumConnectionStatus::Disconnected,
+                )),
+                &mut batch,
+                &mut is_connected,
+            )
+            .await;
+
+        assert!(!is_connected);
+        assert!(!batch.reconnected);
+        assert!(!batch.terminal_disconnect);
+        assert!(!batch.has_work());
     }
 }
