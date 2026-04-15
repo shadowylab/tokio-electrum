@@ -1121,11 +1121,21 @@ dependencies = [
  "futures-util",
  "testenv",
  "tokio",
+ "tokio-happy-eyeballs",
  "tokio-rustls",
  "tokio-socks",
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.2",
+]
+
+[[package]]
+name = "tokio-happy-eyeballs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8564c32dfb6f4257f8bc6edfc178a34af97520e0b7b9815500c55eb3d092f29f"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

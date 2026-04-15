@@ -1170,7 +1170,7 @@ async fn connect_tcp(
 
 async fn connect_direct_tcp(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
     // Connect
-    let stream: TcpStream = TcpStream::connect(addr.to_string()).await?;
+    let stream: TcpStream = tokio_happy_eyeballs::connect(addr.to_string()).await?;
 
     // Split stream
     Ok(split_stream(stream))
@@ -1202,7 +1202,7 @@ async fn connect_ssl(
 
 async fn connect_direct_ssl(addr: &HostAndPort) -> Result<(BoxReadStream, BoxWriteStream), Error> {
     // Connect to the server
-    let tcp_stream: TcpStream = TcpStream::connect(addr.to_string()).await?;
+    let tcp_stream: TcpStream = tokio_happy_eyeballs::connect(addr.to_string()).await?;
 
     // Create TLS configuration
     ssl_connector(addr, tcp_stream).await
