@@ -36,6 +36,7 @@ impl AtomicElectrumConnectionStatus {
             3 => InternalElectrumConnectionStatus::Connected,
             4 => InternalElectrumConnectionStatus::Disconnected,
             5 => InternalElectrumConnectionStatus::Terminated,
+            6 => InternalElectrumConnectionStatus::Shutdown,
             _ => unreachable!(),
         }
     }
@@ -56,18 +57,24 @@ pub(crate) enum InternalElectrumConnectionStatus {
     Disconnected = 4,
     /// The connection has been terminated and no retry will occur.
     Terminated = 5,
+    /// Shutdown
+    Shutdown = 6,
 }
 
 impl InternalElectrumConnectionStatus {
-    /// Check if is `disconnected` or `terminated`.
+    /// Check if is `disconnected`, `terminated` or `shutdown.
     #[inline]
-    pub(crate) fn is_disconnected_or_terminated(&self) -> bool {
-        matches!(self, Self::Disconnected | Self::Terminated)
+    pub(crate) fn is_disconnected_terminated_or_shutdown(&self) -> bool {
+        matches!(self, Self::Disconnected | Self::Terminated | Self::Shutdown)
     }
 
     /// Check if is [`RelayStatus::Terminated`]
     pub(crate) fn is_terminated(&self) -> bool {
         matches!(self, Self::Terminated)
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        matches!(self, Self::Shutdown)
     }
 
     /// Check if relay can start a connection (status is `initialized` or `terminated`)
@@ -85,9 +92,8 @@ impl From<InternalElectrumConnectionStatus> for ElectrumConnectionStatus {
             InternalElectrumConnectionStatus::Connected => ElectrumConnectionStatus::Connected,
             InternalElectrumConnectionStatus::Initialized
             | InternalElectrumConnectionStatus::Disconnected
-            | InternalElectrumConnectionStatus::Terminated => {
-                ElectrumConnectionStatus::Disconnected
-            }
+            | InternalElectrumConnectionStatus::Terminated
+            | InternalElectrumConnectionStatus::Shutdown => ElectrumConnectionStatus::Disconnected,
         }
     }
 }
@@ -149,7 +155,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Initialized;
         // assert!(status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected_or_terminated());
+        assert!(!status.is_disconnected_terminated_or_shutdown());
         assert!(!status.is_terminated());
         assert!(status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
@@ -161,7 +167,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Pending;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected_or_terminated());
+        assert!(!status.is_disconnected_terminated_or_shutdown());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
@@ -173,7 +179,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Connecting;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(!status.is_disconnected_or_terminated());
+        assert!(!status.is_disconnected_terminated_or_shutdown());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
@@ -185,7 +191,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Connected;
         // assert!(!status.is_initialized());
         // assert!(status.is_connected());
-        assert!(!status.is_disconnected_or_terminated());
+        assert!(!status.is_disconnected_terminated_or_shutdown());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
@@ -197,7 +203,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Disconnected;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(status.is_disconnected_or_terminated());
+        assert!(status.is_disconnected_terminated_or_shutdown());
         assert!(!status.is_terminated());
         assert!(!status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);
@@ -209,7 +215,7 @@ mod tests {
         let status = InternalElectrumConnectionStatus::Terminated;
         // assert!(!status.is_initialized());
         // assert!(!status.is_connected());
-        assert!(status.is_disconnected_or_terminated());
+        assert!(status.is_disconnected_terminated_or_shutdown());
         assert!(status.is_terminated());
         assert!(status.can_connect());
         let relay = AtomicElectrumConnectionStatus::new(status);

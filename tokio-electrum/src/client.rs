@@ -289,6 +289,9 @@ impl InnerClient {
                 InternalElectrumConnectionStatus::Terminated => {
                     tracing::info!("Completely disconnected from '{}'", self.addr)
                 }
+                InternalElectrumConnectionStatus::Shutdown => {
+                    tracing::info!("Shutting down connection to '{}'", self.addr)
+                }
             }
         }
 
@@ -356,13 +359,13 @@ impl InnerClient {
             let status: InternalElectrumConnectionStatus = self.status();
 
             // If the connection is terminated, break the loop.
-            if status.is_terminated() {
+            if status.is_terminated() || status.is_shutdown() {
                 break;
             }
 
             // Check if the client is marked as disconnected. If not, update status.
             // Check if disconnected to avoid a possible double log
-            if !status.is_disconnected_or_terminated() {
+            if !status.is_disconnected_terminated_or_shutdown() {
                 self.set_status(InternalElectrumConnectionStatus::Disconnected, true);
             }
 
@@ -646,9 +649,9 @@ pub struct ElectrumClient {
 impl Drop for ElectrumClient {
     #[inline]
     fn drop(&mut self) {
-        tracing::debug!(addr = %self.inner.addr, "Dropping electrum client..");
+        tracing::debug!(addr = %self.inner.addr, "Dropping electrum client.");
 
-        self.disconnect();
+        self.shutdown();
     }
 }
 
@@ -754,7 +757,7 @@ impl ElectrumClient {
         let status = self.internal_status();
 
         // Check if it's already terminated or banned
-        if status.is_terminated() {
+        if status.is_terminated() || status.is_shutdown() {
             return;
         }
 
@@ -764,6 +767,26 @@ impl ElectrumClient {
         // Update status
         self.inner
             .set_status(InternalElectrumConnectionStatus::Terminated, true);
+
+        // Shutdown all notification loops
+        self.inner.send_notification(ElectrumNotification::Shutdown);
+    }
+
+    /// Terminate connection with the electrum server
+    pub fn shutdown(&self) {
+        let status = self.internal_status();
+
+        // Check if it's already terminated or banned
+        if status.is_shutdown() {
+            return;
+        }
+
+        // Notify termination
+        self.inner.channels.terminate();
+
+        // Update status
+        self.inner
+            .set_status(InternalElectrumConnectionStatus::Shutdown, true);
 
         // Shutdown all notification loops
         self.inner.send_notification(ElectrumNotification::Shutdown);
@@ -1396,7 +1419,7 @@ mod tests {
 
         time::sleep(Duration::from_secs(1)).await;
 
-        assert_eq!(inner.status(), InternalElectrumConnectionStatus::Terminated);
+        assert_eq!(inner.status(), InternalElectrumConnectionStatus::Shutdown);
         assert!(!inner.is_running());
     }
 
