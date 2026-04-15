@@ -472,9 +472,13 @@ impl InnerClient {
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum receiver exited with error.")
             },
             // Termination handler
-            _ = self.handle_terminate() => {},
+            _ = self.handle_terminate() => {
+                tracing::warn!(addr = %self.addr, "Received termination request.");
+            },
             // Pinger
-            _ = self.pinger() => {}
+            _ = self.pinger() => {
+                tracing::warn!(addr = %self.addr, "Electrum pinger exited.");
+            }
         }
 
         // Notify disconnection
@@ -528,10 +532,18 @@ impl InnerClient {
                     tracing::trace!(addr = %self.addr, "Ping sent.");
                 }
                 // Batch request receiver
-                Some(batch_request) = rx_batch_request.recv() => {
-                    tracing::trace!("Sending batch request: {:?}", batch_request);
-
-                    client.send_batch(batch_request)?;
+                batch_request = rx_batch_request.recv() => match batch_request {
+                    Some(batch_request) => {
+                        tracing::trace!("Sending batch request: {:?}", batch_request);
+                        client.send_batch(batch_request)?;
+                    }
+                    None => {
+                        tracing::warn!(
+                            addr = %self.addr,
+                            "Electrum sender loop is exiting because all batch request senders were dropped."
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -587,6 +599,11 @@ impl InnerClient {
                 self.send_notification(notification);
             }
         }
+
+        tracing::warn!(
+            addr = %self.addr,
+            "Electrum event stream ended (peer may have closed the connection)."
+        );
 
         Ok(())
     }
