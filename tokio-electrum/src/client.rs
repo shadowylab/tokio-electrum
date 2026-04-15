@@ -458,17 +458,17 @@ impl InnerClient {
         // Add also termination here, to allow closing the connection in case of termination request.
         tokio::select! {
             res = worker => match res {
-                Ok(()) => tracing::trace!(addr = %self.addr, "Electrum worker exited."),
+                Ok(()) => tracing::warn!(addr = %self.addr, "Electrum worker exited."),
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum worker exited with error.")
             },
             // Message sender handler
             res = self.sender_message_handler(&client, rx_batch_requests) => match res {
-                Ok(()) => tracing::trace!(addr = %self.addr, "Electrum sender exited."),
+                Ok(()) => tracing::warn!(addr = %self.addr, "Electrum sender exited."),
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum sender exited with error.")
             },
             // Message receiver handler
             res = self.receiver_message_handler(receiver) => match res {
-                Ok(()) => tracing::trace!(addr = %self.addr, "Electrum receiver exited."),
+                Ok(()) => tracing::warn!(addr = %self.addr, "Electrum receiver exited."),
                 Err(e) => tracing::error!(addr = %self.addr, error = %e, "Electrum receiver exited with error.")
             },
             // Termination handler
