@@ -533,11 +533,8 @@ impl InnerClient {
 
                     client.send_batch(batch_request)?;
                 }
-                else => break
             }
         }
-
-        Ok(())
     }
 
     async fn receiver_message_handler(
