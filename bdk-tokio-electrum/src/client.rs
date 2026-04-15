@@ -19,6 +19,7 @@ use tokio_electrum::types::{
 };
 
 use crate::accumulator::FullScanAccumulator;
+use crate::checkpoint::{ScriptSyncCheckpoint, SyncCheckpoint};
 use crate::constant::{
     BATCH_TRANSACTION_GET_SIZE, BATCH_TX_GET_MERKLE_SIZE, CHAIN_SUFFIX_LENGTH, DEFAULT_BATCH_SIZE,
     DEFAULT_BATCH_WINDOW, DEFAULT_STOP_GAP, DEFAULT_WALLET_LABEL,
@@ -49,17 +50,23 @@ pub(crate) struct SpkScanResult {
 pub enum SubscribeEvent<K> {
     /// Initial full scan response emitted once at stream start.
     Initial(FullScanResponse<K>),
+    /// Checkpoint snapshot that can be persisted for incremental resume.
+    Checkpoint(SyncCheckpoint<K>),
     /// Incremental update emitted for script hash and header notifications.
     Update(SyncResponse<ConfirmationBlockTime>),
     /// Stream has been terminated (for example client shutdown).
     Disconnected,
 }
 
-/// Sync wallet API
+/// Sync wallet API.
+///
+/// Awaiting this builder returns an event stream that includes checkpoint snapshots for
+/// incremental resume.
 #[must_use = "Does nothing unless you await!"]
 pub struct SyncWallet<'client, K> {
     client: &'client BdkElectrumClient,
     request: FullScanRequest<K>,
+    checkpoint: Option<SyncCheckpoint<K>>,
     stop_gap: NonZeroU32,
     batch_size: NonZeroU32,
     fetch_prev_txouts: bool,
@@ -75,6 +82,7 @@ where
         Self {
             client,
             request,
+            checkpoint: None,
             stop_gap: DEFAULT_STOP_GAP,
             batch_size: DEFAULT_BATCH_SIZE,
             fetch_prev_txouts: false,
@@ -111,6 +119,13 @@ where
         self
     }
 
+    /// Resume from a previously persisted [`SyncCheckpoint`] without running a full scan.
+    #[inline]
+    pub fn checkpoint(mut self, checkpoint: SyncCheckpoint<K>) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
     /// Set a wallet label for logs (default: unlabeled)
     #[inline]
     pub fn label<T>(mut self, label: T) -> Self
@@ -134,6 +149,7 @@ where
             self.client
                 .run_sync(
                     self.request,
+                    self.checkpoint,
                     self.stop_gap,
                     self.batch_size,
                     self.fetch_prev_txouts,
@@ -651,11 +667,15 @@ impl BdkElectrumClient {
         Ok((response, subscription_init))
     }
 
-    /// Subscribe using a full scan request.
+    /// Build a wallet sync stream from a full-scan request.
     ///
-    /// The returned stream first yields [`SubscribeEvent::Initial`] with the complete
-    /// [`FullScanResponse`], then yields batched [`SubscribeEvent::Update`] values.
-    /// On terminal shutdown, it yields [`SubscribeEvent::Disconnected`] and then terminates.
+    /// You can optionally call [`SyncWallet::checkpoint`] before awaiting to resume from a
+    /// persisted incremental state.
+    ///
+    /// Awaiting the returned builder yields:
+    /// - a stream that first emits [`SubscribeEvent::Initial`], then a
+    ///   [`SubscribeEvent::Checkpoint`] snapshot, and then live
+    ///   [`SubscribeEvent::Update`] + [`SubscribeEvent::Checkpoint`] pairs
     #[inline]
     pub fn sync<K, R>(&self, request: R) -> SyncWallet<'_, K>
     where
@@ -665,9 +685,11 @@ impl BdkElectrumClient {
         SyncWallet::new(self, request.into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_sync<K>(
         &self,
         mut request: FullScanRequest<K>,
+        checkpoint: Option<SyncCheckpoint<K>>,
         stop_gap: NonZeroU32,
         batch_size: NonZeroU32,
         fetch_prev_txouts: bool,
@@ -680,17 +702,57 @@ impl BdkElectrumClient {
         let start_time: u64 = request.start_time();
         let notification_rx = self.inner.notifications();
 
-        tracing::info!(wallet = %wallet_label, "Wallet loading history.");
+        let (response, subscription_init, checkpoint) = match checkpoint {
+            Some(checkpoint) => {
+                tracing::info!(wallet = %wallet_label, "Resuming from incremental checkpoint.");
 
-        let (response, subscription_init) = self
-            .internal_full_scan(
-                &wallet_label,
-                &mut request,
-                stop_gap,
-                batch_size,
-                fetch_prev_txouts,
-            )
-            .await?;
+                if !checkpoint_is_compatible_with_request(&checkpoint, &request) {
+                    tracing::warn!(
+                        wallet = %wallet_label,
+                        "Checkpoint is incompatible with request, falling back to full scan."
+                    );
+
+                    let (response, subscription_init) = self
+                        .internal_full_scan(
+                            &wallet_label,
+                            &mut request,
+                            stop_gap,
+                            batch_size,
+                            fetch_prev_txouts,
+                        )
+                        .await?;
+                    let checkpoint = build_sync_checkpoint(&response, &subscription_init);
+                    (response, subscription_init, checkpoint)
+                } else {
+                    bootstrap_checkpoint_subscriptions(self, &checkpoint).await?;
+
+                    advance_request_cursor_to_checkpoint(&mut request, &checkpoint);
+
+                    let response = FullScanResponse {
+                        tx_update: TxUpdate::default(),
+                        chain_update: checkpoint.chain_tip.clone(),
+                        last_active_indices: checkpoint.last_active_indices.clone(),
+                    };
+                    let subscription_init = subscription_init_from_checkpoint(&checkpoint);
+                    (response, subscription_init, checkpoint)
+                }
+            }
+            None => {
+                tracing::info!(wallet = %wallet_label, "Wallet loading history.");
+
+                let (response, subscription_init) = self
+                    .internal_full_scan(
+                        &wallet_label,
+                        &mut request,
+                        stop_gap,
+                        batch_size,
+                        fetch_prev_txouts,
+                    )
+                    .await?;
+                let checkpoint = build_sync_checkpoint(&response, &subscription_init);
+                (response, subscription_init, checkpoint)
+            }
+        };
 
         let live_engine = LiveSyncEngine::new(
             self.clone(),
@@ -706,7 +768,13 @@ impl BdkElectrumClient {
         let live_stream = live_engine.into_stream(notification_rx);
 
         let initial_event = stream::once(async move { Ok(SubscribeEvent::Initial(response)) });
-        Ok(Box::pin(initial_event.chain(live_stream)))
+        let initial_checkpoint_event =
+            stream::once(async move { Ok(SubscribeEvent::Checkpoint(checkpoint)) });
+        Ok(Box::pin(
+            initial_event
+                .chain(initial_checkpoint_event)
+                .chain(live_stream),
+        ))
     }
 
     pub(crate) async fn maybe_extend_after_activity<K>(
@@ -1113,6 +1181,155 @@ impl BdkElectrumClient {
 
         Ok(())
     }
+}
+
+fn build_sync_checkpoint<K>(
+    response: &FullScanResponse<K>,
+    subscription_init: &SubscriptionInit<K>,
+) -> SyncCheckpoint<K>
+where
+    K: Ord + Clone,
+{
+    let mut scripts: HashMap<ElectrumScriptHash, ScriptSyncCheckpoint<K>> =
+        HashMap::with_capacity(subscription_init.script_subscriptions.len());
+
+    for (hash, subscription) in &subscription_init.script_subscriptions {
+        let Some((keychain, index)) = subscription_init.script_to_keychain_index.get(hash) else {
+            continue;
+        };
+
+        scripts.insert(
+            *hash,
+            ScriptSyncCheckpoint {
+                keychain: keychain.clone(),
+                index: *index,
+                last_status: subscription.last_status,
+                expected_tx_heights: subscription.expected_tx_heights.clone(),
+            },
+        );
+    }
+
+    SyncCheckpoint {
+        chain_tip: response.chain_update.clone(),
+        last_active_indices: response.last_active_indices.clone(),
+        max_subscribed_indices: subscription_init.max_subscribed_indices.clone(),
+        scripts,
+    }
+}
+
+fn subscription_init_from_checkpoint<K>(checkpoint: &SyncCheckpoint<K>) -> SubscriptionInit<K>
+where
+    K: Ord + Clone,
+{
+    let mut subscribed_scripts = HashSet::with_capacity(checkpoint.scripts.len());
+    let mut script_subscriptions = HashMap::with_capacity(checkpoint.scripts.len());
+    let mut script_to_keychain_index = HashMap::with_capacity(checkpoint.scripts.len());
+
+    for (hash, script_checkpoint) in &checkpoint.scripts {
+        subscribed_scripts.insert(*hash);
+        script_subscriptions.insert(
+            *hash,
+            ScriptSubscription::with_status(
+                script_checkpoint.expected_tx_heights.clone(),
+                script_checkpoint.last_status,
+            ),
+        );
+        script_to_keychain_index.insert(
+            *hash,
+            (script_checkpoint.keychain.clone(), script_checkpoint.index),
+        );
+    }
+
+    SubscriptionInit {
+        subscribed_scripts,
+        script_subscriptions,
+        script_to_keychain_index,
+        max_subscribed_indices: checkpoint.max_subscribed_indices.clone(),
+    }
+}
+
+fn advance_request_cursor_to_checkpoint<K>(
+    request: &mut FullScanRequest<K>,
+    checkpoint: &SyncCheckpoint<K>,
+) where
+    K: Ord + Clone,
+{
+    for (keychain, max_index) in &checkpoint.max_subscribed_indices {
+        let mut remaining: u32 = max_index.saturating_add(1);
+
+        while remaining > 0 {
+            if request.next_spk(keychain.clone()).is_none() {
+                break;
+            }
+            remaining = remaining.saturating_sub(1);
+        }
+    }
+}
+
+fn checkpoint_is_compatible_with_request<K>(
+    checkpoint: &SyncCheckpoint<K>,
+    request: &FullScanRequest<K>,
+) -> bool
+where
+    K: Ord + Clone,
+{
+    let request_keychains: BTreeSet<K> = request.keychains().into_iter().collect();
+
+    for (keychain, last_active) in &checkpoint.last_active_indices {
+        if !request_keychains.contains(keychain) {
+            return false;
+        }
+        if checkpoint
+            .max_subscribed_indices
+            .get(keychain)
+            .is_some_and(|max| max < last_active)
+        {
+            return false;
+        }
+    }
+
+    for keychain in checkpoint.max_subscribed_indices.keys() {
+        if !request_keychains.contains(keychain) {
+            return false;
+        }
+    }
+
+    for script_checkpoint in checkpoint.scripts.values() {
+        if !request_keychains.contains(&script_checkpoint.keychain) {
+            return false;
+        }
+        let Some(max_index) = checkpoint
+            .max_subscribed_indices
+            .get(&script_checkpoint.keychain)
+        else {
+            return false;
+        };
+        if script_checkpoint.index > *max_index {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn bootstrap_checkpoint_subscriptions<K>(
+    client: &BdkElectrumClient,
+    checkpoint: &SyncCheckpoint<K>,
+) -> Result<(), Error>
+where
+    K: Ord + Clone,
+{
+    client.block_headers_subscribe().await?;
+
+    if checkpoint.scripts.is_empty() {
+        return Ok(());
+    }
+
+    client
+        .batch_script_hash_subscribe(checkpoint.scripts.keys().copied())
+        .await?;
+
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1527,6 +1744,116 @@ mod tests {
             lookup.get(&ElectrumScriptHash::new(&script(0x54))),
             Some(&("external".to_string(), 3))
         );
+    }
+
+    #[test]
+    fn build_sync_checkpoint_roundtrip_preserves_script_state() {
+        let keychain = "external".to_string();
+        let hash = ElectrumScriptHash::new(&script(0x66));
+        let status = ElectrumScriptStatus::from_str(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let known_txid = txid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let response = FullScanResponse {
+            tx_update: TxUpdate::default(),
+            chain_update: None,
+            last_active_indices: BTreeMap::from([(keychain.clone(), 3_u32)]),
+        };
+        let subscription_init = SubscriptionInit {
+            subscribed_scripts: HashSet::from([hash]),
+            script_subscriptions: HashMap::from([(
+                hash,
+                ScriptSubscription::with_status(
+                    HashMap::from([(known_txid, 120_i64)]),
+                    Some(status),
+                ),
+            )]),
+            script_to_keychain_index: HashMap::from([(hash, (keychain.clone(), 4_u32))]),
+            max_subscribed_indices: BTreeMap::from([(keychain.clone(), 4_u32)]),
+        };
+
+        let checkpoint = build_sync_checkpoint(&response, &subscription_init);
+        assert_eq!(checkpoint.last_active_indices.get(&keychain), Some(&3_u32));
+        assert_eq!(
+            checkpoint.max_subscribed_indices.get(&keychain),
+            Some(&4_u32)
+        );
+        assert_eq!(checkpoint.scripts.get(&hash).map(|s| s.index), Some(4_u32));
+        assert_eq!(
+            checkpoint.scripts.get(&hash).and_then(|s| s.last_status),
+            Some(status)
+        );
+        assert_eq!(
+            checkpoint
+                .scripts
+                .get(&hash)
+                .and_then(|s| s.expected_tx_heights.get(&known_txid))
+                .copied(),
+            Some(120_i64)
+        );
+
+        let rebuilt = subscription_init_from_checkpoint(&checkpoint);
+        assert!(rebuilt.subscribed_scripts.contains(&hash));
+        assert_eq!(
+            rebuilt.script_to_keychain_index.get(&hash),
+            Some(&(keychain.clone(), 4_u32))
+        );
+        assert_eq!(rebuilt.max_subscribed_indices.get(&keychain), Some(&4_u32));
+        assert_eq!(
+            rebuilt
+                .script_subscriptions
+                .get(&hash)
+                .and_then(|s| s.last_status),
+            Some(status)
+        );
+    }
+
+    #[test]
+    fn checkpoint_compatibility_rejects_unknown_keychain() {
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain("external".to_string(), vec![(0, script(0x70))])
+            .build();
+        let checkpoint = SyncCheckpoint {
+            chain_tip: None,
+            last_active_indices: BTreeMap::new(),
+            max_subscribed_indices: BTreeMap::from([("internal".to_string(), 1_u32)]),
+            scripts: HashMap::new(),
+        };
+
+        assert!(!checkpoint_is_compatible_with_request(
+            &checkpoint,
+            &request
+        ));
+    }
+
+    #[test]
+    fn checkpoint_compatibility_rejects_script_index_beyond_max() {
+        let keychain = "external".to_string();
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(keychain.clone(), vec![(0, script(0x71)), (1, script(0x72))])
+            .build();
+        let hash = ElectrumScriptHash::new(&script(0x71));
+        let checkpoint = SyncCheckpoint {
+            chain_tip: None,
+            last_active_indices: BTreeMap::new(),
+            max_subscribed_indices: BTreeMap::from([(keychain.clone(), 1_u32)]),
+            scripts: HashMap::from([(
+                hash,
+                ScriptSyncCheckpoint {
+                    keychain,
+                    index: 3_u32,
+                    last_status: None,
+                    expected_tx_heights: HashMap::new(),
+                },
+            )]),
+        };
+
+        assert!(!checkpoint_is_compatible_with_request(
+            &checkpoint,
+            &request
+        ));
     }
 
     #[tokio::test]
@@ -2760,6 +3087,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_stream_from_checkpoint_catches_offline_tx_without_full_scan() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+
+        let addresses = (0..40)
+            .map(|_| env.bitcoind.client.new_address().unwrap())
+            .collect::<Vec<_>>();
+        let spks = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| (i as u32, addr.script_pubkey()))
+            .collect::<Vec<_>>();
+        let keychain = "external".to_string();
+
+        let client = connected_bdk_client(&env).await;
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(keychain.clone(), spks.clone())
+            .build();
+
+        let mut stream = client
+            .sync(request)
+            .stop_gap(NonZeroU32::new(20).unwrap())
+            .await
+            .unwrap();
+
+        let first = timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for initial event")
+            .expect("stream terminated before initial event")
+            .expect("initial event should not error");
+        match first {
+            SubscribeEvent::Initial(initial) => {
+                assert!(
+                    initial.tx_update.txs.is_empty(),
+                    "bootstrap from empty wallet should not include txs"
+                );
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+        let checkpoint = match timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for initial checkpoint event")
+            .expect("stream terminated before initial checkpoint event")
+            .expect("initial checkpoint event should not error")
+        {
+            SubscribeEvent::Checkpoint(checkpoint) => checkpoint,
+            other => panic!("expected checkpoint event second, got: {:?}", other),
+        };
+
+        client.disconnect();
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&addresses[10], Amount::from_sat(34_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let resumed_client = connected_bdk_client(&env).await;
+        let resumed_request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(keychain, spks)
+            .build();
+        let mut resumed_stream = resumed_client
+            .sync(resumed_request)
+            .checkpoint(checkpoint)
+            .stop_gap(NonZeroU32::new(20).unwrap())
+            .await
+            .unwrap();
+
+        let resumed_first = timeout(Duration::from_secs(20), resumed_stream.next())
+            .await
+            .expect("timed out waiting for resumed initial event")
+            .expect("resumed stream terminated before initial event")
+            .expect("resumed initial event should not error");
+        match resumed_first {
+            SubscribeEvent::Initial(initial) => {
+                assert!(
+                    initial.tx_update.txs.is_empty(),
+                    "resume initial event must not perform a full scan"
+                );
+            }
+            other => panic!("expected initial event first, got: {:?}", other),
+        }
+
+        let saw_offline_tx = timeout(Duration::from_secs(30), async {
+            while let Some(event) = resumed_stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_offline_tx,
+            "resume stream should reconcile offline tx from status delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_stream_emits_checkpoint_events_for_initial_and_live_updates() {
+        let env = TestEnv::new();
+        ensure_funded_wallet(&env);
+        let client = connected_bdk_client(&env).await;
+
+        let tracked_address = env.bitcoind.client.new_address().unwrap();
+        let tracked_hash = ElectrumScriptHash::new(&tracked_address.script_pubkey());
+        let request = FullScanRequest::<String>::builder_at(0)
+            .spks_for_keychain(
+                "external".to_string(),
+                vec![(0, tracked_address.script_pubkey())],
+            )
+            .build();
+        let mut stream = client.sync(request).await.unwrap();
+
+        let first = timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for initial event")
+            .expect("stream terminated before initial event")
+            .expect("initial event should not error");
+        assert!(
+            matches!(first, SubscribeEvent::Initial(_)),
+            "first event should be initial"
+        );
+
+        let second = timeout(Duration::from_secs(20), stream.next())
+            .await
+            .expect("timed out waiting for initial checkpoint event")
+            .expect("stream terminated before initial checkpoint event")
+            .expect("initial checkpoint event should not error");
+        let checkpoint_after_initial = match second {
+            SubscribeEvent::Checkpoint(checkpoint) => checkpoint,
+            other => panic!("expected checkpoint event after initial, got: {:?}", other),
+        };
+        assert!(
+            checkpoint_after_initial.scripts.contains_key(&tracked_hash),
+            "initial checkpoint should include tracked script"
+        );
+
+        let txid = env
+            .bitcoind
+            .client
+            .send_to_address(&tracked_address, Amount::from_sat(36_000))
+            .unwrap()
+            .txid()
+            .unwrap();
+        env.electrsd.wait_tx(&txid);
+
+        let saw_update_and_checkpoint = timeout(Duration::from_secs(30), async {
+            let mut saw_tx_update = false;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(SubscribeEvent::Update(update))
+                        if update
+                            .tx_update
+                            .txs
+                            .iter()
+                            .any(|tx| tx.compute_txid() == txid) =>
+                    {
+                        saw_tx_update = true;
+                    }
+                    Ok(SubscribeEvent::Checkpoint(checkpoint))
+                        if saw_tx_update
+                            && checkpoint.scripts.get(&tracked_hash).is_some_and(|script| {
+                                script.expected_tx_heights.contains_key(&txid)
+                            }) =>
+                    {
+                        return true;
+                    }
+                    Ok(SubscribeEvent::Disconnected) => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            saw_update_and_checkpoint,
+            "expected checkpoint event carrying tracked tx state after live update"
+        );
+    }
+
+    #[tokio::test]
     async fn sync_stream_emits_disconnected_event_on_disconnect() {
         let env = TestEnv::new();
         let client = connected_bdk_client(&env).await;
@@ -2824,6 +3351,11 @@ mod tests {
             .await
             .expect("expected initial event")
             .expect("initial event should not error");
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial checkpoint event")
+            .expect("initial checkpoint event should not error");
 
         // Subscribe directly on the underlying client to force unrelated script notifications.
         client.script_hash_subscribe(other_hash).await.unwrap();
@@ -3006,6 +3538,7 @@ mod tests {
                     }
                     Ok(SubscribeEvent::Disconnected) => return false,
                     Ok(SubscribeEvent::Initial(_)) => {}
+                    Ok(SubscribeEvent::Checkpoint(_)) => {}
                     Err(_) => return false,
                 }
             }
@@ -3077,6 +3610,7 @@ mod tests {
                     }
                     Ok(SubscribeEvent::Disconnected) => return false,
                     Ok(SubscribeEvent::Initial(_)) => {}
+                    Ok(SubscribeEvent::Checkpoint(_)) => {}
                     Err(_) => return false,
                 }
             }
@@ -3149,6 +3683,7 @@ mod tests {
                     Ok(SubscribeEvent::Update(_)) => {}
                     Ok(SubscribeEvent::Disconnected) => return false,
                     Ok(SubscribeEvent::Initial(_)) => {}
+                    Ok(SubscribeEvent::Checkpoint(_)) => {}
                     Err(_) => return false,
                 }
             }
@@ -3187,6 +3722,11 @@ mod tests {
             .await
             .expect("expected initial event")
             .expect("initial event should not error");
+        let _ = stream
+            .next()
+            .await
+            .expect("expected initial checkpoint event")
+            .expect("initial checkpoint event should not error");
         let mut probe_notifications = client.notifications();
 
         env.bitcoind
@@ -3214,23 +3754,33 @@ mod tests {
 
         client.disconnect();
 
-        let first = timeout(Duration::from_secs(20), stream.next())
-            .await
-            .expect("timed out waiting for first post-disconnect event")
-            .expect("stream ended before first post-disconnect event")
-            .expect("first post-disconnect event should not error");
-        let second = timeout(Duration::from_secs(20), stream.next())
-            .await
-            .expect("timed out waiting for second post-disconnect event")
-            .expect("stream ended before second post-disconnect event")
-            .expect("second post-disconnect event should not error");
+        let mut saw_chain_update = false;
+        let mut saw_disconnected = false;
+        for _ in 0..3 {
+            let event = timeout(Duration::from_secs(20), stream.next())
+                .await
+                .expect("timed out waiting for post-disconnect event")
+                .expect("stream ended before post-disconnect event")
+                .expect("post-disconnect event should not error");
+            match event {
+                SubscribeEvent::Update(update) if update.chain_update.is_some() => {
+                    saw_chain_update = true;
+                }
+                SubscribeEvent::Checkpoint(_) => {}
+                SubscribeEvent::Disconnected => {
+                    saw_disconnected = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
 
         assert!(
-            matches!(first, SubscribeEvent::Update(ref u) if u.chain_update.is_some()),
+            saw_chain_update,
             "expected pending chain update before disconnect marker"
         );
         assert!(
-            matches!(second, SubscribeEvent::Disconnected),
+            saw_disconnected,
             "expected disconnected marker after pending update"
         );
     }

@@ -14,6 +14,7 @@ use tokio_electrum::client::Error;
 use tokio_electrum::notification::ElectrumNotification;
 use tokio_electrum::prelude::{ElectrumScriptHash, ElectrumScriptStatus};
 
+use crate::checkpoint::{ScriptSyncCheckpoint, SyncCheckpoint};
 use crate::client::{BdkElectrumClient, SubscribeEvent, SubscribeStream};
 use crate::constant::LIVE_SYNC_HISTORY_BATCH_SIZE;
 use crate::subscription::{SubscriptionCtx, SubscriptionInit, SubscriptionState};
@@ -42,6 +43,7 @@ struct LiveStreamState<K> {
     engine: LiveSyncEngine<K>,
     notification_rx: broadcast::Receiver<ElectrumNotification>,
     is_connected: bool,
+    pending_checkpoint: Option<SyncCheckpoint<K>>,
     pending_terminal_disconnect: bool,
     done: bool,
 }
@@ -103,6 +105,7 @@ where
             is_connected: self.client.status().is_connected(),
             engine: self,
             notification_rx,
+            pending_checkpoint: None,
             pending_terminal_disconnect: false,
             done: false,
         };
@@ -110,6 +113,10 @@ where
         let stream = stream::unfold(initial_state, move |mut state| async move {
             if state.done {
                 return None;
+            }
+
+            if let Some(checkpoint) = state.pending_checkpoint.take() {
+                return Some((Ok(SubscribeEvent::Checkpoint(checkpoint)), state));
             }
 
             if state.pending_terminal_disconnect {
@@ -124,7 +131,8 @@ where
                     .next_pending_batch(&mut state.notification_rx, &mut state.is_connected)
                     .await;
                 match state.engine.build_sync_update_from_batch(&mut batch).await {
-                    Ok(Some(update)) => {
+                    Ok(Some((update, checkpoint))) => {
+                        state.pending_checkpoint = Some(checkpoint);
                         state.pending_terminal_disconnect = batch.terminal_disconnect;
                         return Some((Ok(SubscribeEvent::Update(update)), state));
                     }
@@ -225,7 +233,7 @@ where
     async fn build_sync_update_from_batch(
         &self,
         batch: &mut PendingBatch,
-    ) -> Result<Option<SyncResponse<ConfirmationBlockTime>>, Error> {
+    ) -> Result<Option<(SyncResponse<ConfirmationBlockTime>, SyncCheckpoint<K>)>, Error> {
         self.reconcile_after_reconnect(batch).await?;
 
         let chain_update = self.apply_chain_tip_update_from_batch(batch).await;
@@ -250,10 +258,14 @@ where
             "Emitting realtime sync batch."
         );
 
-        Ok(Some(SyncResponse {
-            tx_update,
-            chain_update,
-        }))
+        let checkpoint = self.current_checkpoint_snapshot().await;
+        Ok(Some((
+            SyncResponse {
+                tx_update,
+                chain_update,
+            },
+            checkpoint,
+        )))
     }
 
     async fn reconcile_after_reconnect(&self, batch: &mut PendingBatch) -> Result<(), Error> {
@@ -353,6 +365,36 @@ where
         dedup_tx_update_txs(&mut tx_update);
 
         Ok(tx_update)
+    }
+
+    async fn current_checkpoint_snapshot(&self) -> SyncCheckpoint<K> {
+        let chain_tip = self.ctx.chain_tip.lock().await.clone();
+        let state = self.ctx.state.lock().await;
+        let mut scripts: HashMap<ElectrumScriptHash, ScriptSyncCheckpoint<K>> =
+            HashMap::with_capacity(state.script_subscriptions.len());
+
+        for (hash, subscription) in &state.script_subscriptions {
+            let Some((keychain, index)) = state.script_to_keychain_index.get(hash) else {
+                continue;
+            };
+
+            scripts.insert(
+                *hash,
+                ScriptSyncCheckpoint {
+                    keychain: keychain.clone(),
+                    index: *index,
+                    last_status: subscription.last_status,
+                    expected_tx_heights: subscription.expected_tx_heights.clone(),
+                },
+            );
+        }
+
+        SyncCheckpoint {
+            chain_tip,
+            last_active_indices: state.last_active_indices.clone(),
+            max_subscribed_indices: state.max_subscribed_indices.clone(),
+            scripts,
+        }
     }
 }
 

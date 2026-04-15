@@ -6,10 +6,12 @@
 #![warn(rustdoc::bare_urls)]
 
 mod accumulator;
+mod checkpoint;
 mod client;
 mod constant;
 mod live_sync_engine;
 mod subscription;
 mod util;
 
+pub use self::checkpoint::*;
 pub use self::client::*;
