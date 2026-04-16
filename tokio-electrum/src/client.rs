@@ -10,8 +10,7 @@ use std::time::Duration;
 use std::{fmt, io};
 
 use bitcoin::block::Header;
-use bitcoin::constants::ChainHash;
-use bitcoin::{FeeRate, Network, Transaction, Txid};
+use bitcoin::{FeeRate, Transaction, Txid};
 use electrum_streaming_client::notification::Notification;
 use electrum_streaming_client::request::{
     BroadcastTx, EstimateFee, Features as GetServerFeatures, GetHistory, GetTx, GetTxMerkle,
@@ -70,8 +69,6 @@ pub enum Error {
     Socks(tokio_socks::Error),
     /// MPSC try send error
     MpscTrySend(String),
-    /// Network mismatch
-    NetworkMismatch,
     /// Local command queue is saturated
     CommandQueueSaturated,
     /// Timeout
@@ -96,9 +93,6 @@ impl fmt::Display for Error {
             #[cfg(feature = "socks")]
             Self::Socks(e) => e.fmt(f),
             Self::MpscTrySend(e) => e.fmt(f),
-            Self::NetworkMismatch => {
-                f.write_str("the server network does not match the expected network")
-            }
             Self::CommandQueueSaturated => {
                 f.write_str("the local electrum command queue is saturated")
             }
@@ -172,7 +166,6 @@ struct Config {
     reconnect_delay_initial: Duration,
     reconnect_delay_max: Duration,
     max_consecutive_ping_timeouts: u8,
-    expected_network: Option<Network>,
 }
 
 #[derive(Debug)]
@@ -220,30 +213,12 @@ impl Channels {
     }
 }
 
-#[derive(Debug, Default)]
-struct ServicesTracker {
-    network_mismatch: AtomicBool,
-}
-
-impl ServicesTracker {
-    #[inline]
-    fn network_mismatch(&self) -> bool {
-        self.network_mismatch.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    fn set_network_mismatch(&self, value: bool) {
-        self.network_mismatch.store(value, Ordering::SeqCst);
-    }
-}
-
 #[derive(Debug)]
 struct InnerClient {
     addr: ElectrumServerAddress,
     status: AtomicElectrumConnectionStatus,
     running: AtomicBool,
     channels: Channels,
-    tracker: ServicesTracker,
     notification_sender: broadcast::Sender<ElectrumNotification>,
     config: Config,
 }
@@ -297,33 +272,6 @@ impl InnerClient {
 
         // Send notification
         self.send_notification(ElectrumNotification::ConnectionStatusChanged(status.into()));
-    }
-
-    async fn validate_network(&self, client: &AsyncClient) -> Result<(), Error> {
-        // Validate network
-        let Some(expected_network) = self.config.expected_network else {
-            return Ok(());
-        };
-
-        let features: ServerFeatures =
-            send_request_with_timeout(client, self.config.request_timeout, GetServerFeatures)
-                .await?;
-
-        let server_chain_hash: ChainHash =
-            ChainHash::from_genesis_block_hash(features.genesis_hash);
-
-        if server_chain_hash != expected_network.chain_hash() {
-            // Set network mismatch
-            self.tracker.set_network_mismatch(true);
-
-            // Mark as terminated
-            self.set_status(InternalElectrumConnectionStatus::Terminated, true);
-
-            // Return error
-            return Err(Error::NetworkMismatch);
-        }
-
-        Ok(())
     }
 
     #[inline]
@@ -496,9 +444,6 @@ impl InnerClient {
         client: &AsyncClient,
         rx_batch_request: &mut MutexGuard<'_, Receiver<AsyncBatchRequest>>,
     ) -> Result<(), Error> {
-        // Validate the network before start processing the requests
-        self.validate_network(client).await?;
-
         let mut consecutive_ping_timeouts: u8 = 0;
         let max_ping_timeouts = self.config.max_consecutive_ping_timeouts;
 
@@ -622,10 +567,6 @@ impl InnerClient {
     }
 
     async fn send_batch(&self, batch: AsyncBatchRequest) -> Result<(), Error> {
-        if self.tracker.network_mismatch() {
-            return Err(Error::NetworkMismatch);
-        }
-
         let send_result = time::timeout(
             self.config.request_timeout,
             self.channels.commands.0.send(batch),
@@ -677,7 +618,6 @@ impl ElectrumClient {
                 status: AtomicElectrumConnectionStatus::default(),
                 running: AtomicBool::new(false),
                 channels: Channels::new(builder.command_channel_size),
-                tracker: ServicesTracker::default(),
                 notification_sender,
                 config: Config {
                     connection_mode: builder.connection_mode,
@@ -687,7 +627,6 @@ impl ElectrumClient {
                     reconnect_delay_initial: builder.reconnect_delay_initial,
                     reconnect_delay_max: builder.reconnect_delay_max,
                     max_consecutive_ping_timeouts: builder.max_consecutive_ping_timeouts.max(1),
-                    expected_network: builder.expected_network,
                 },
             }),
         }
@@ -1475,18 +1414,6 @@ mod tests {
         client.inner.running.store(true, Ordering::SeqCst);
         client.spawn_connection_task();
         assert!(client.inner.running.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn test_send_batch_returns_network_mismatch() {
-        let client = test_client();
-        client.inner.tracker.set_network_mismatch(true);
-
-        let err = client
-            .block_headers_subscribe()
-            .await
-            .expect_err("must fail");
-        assert!(matches!(err, Error::NetworkMismatch));
     }
 
     #[tokio::test]
