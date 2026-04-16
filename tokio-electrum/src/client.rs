@@ -770,6 +770,39 @@ impl ElectrumClient {
         Ok(resp.header)
     }
 
+    /// Get block header
+    pub async fn batch_block_header<T>(&self, heights: T) -> Result<Vec<Header>, Error>
+    where
+        T: IntoIterator<Item = u32>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+
+        let mut futures = Vec::new();
+
+        for height in heights {
+            let fut = batch.request(GetBlockHeader { height });
+            futures.push(fut);
+        }
+
+        if futures.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.inner.send_batch(batch).await?;
+
+        let resp = self.wait_batch_response(future::join_all(futures)).await?;
+
+        let mut output: Vec<Header> = Vec::with_capacity(resp.len());
+
+        // Propagate error
+        // This avoids silently dropping the error, which may cause a partial sync.
+        for res in resp {
+            output.push(res?.header);
+        }
+
+        Ok(output)
+    }
+
     /// Tries to fetch `count` block headers starting from `start_height`.
     pub async fn block_headers(
         &self,
@@ -1006,7 +1039,7 @@ impl ElectrumClient {
     pub async fn batch_transaction_get_merkle<I>(
         &self,
         txids_and_heights: I,
-    ) -> Result<Vec<Result<TransactionMerkel, Error>>, Error>
+    ) -> Result<Vec<TransactionMerkel>, Error>
     where
         I: IntoIterator<Item = (Txid, u32)>,
     {
@@ -1025,10 +1058,14 @@ impl ElectrumClient {
         self.inner.send_batch(batch).await?;
 
         let resp = self.wait_batch_response(future::join_all(futures)).await?;
-        Ok(resp
-            .into_iter()
-            .map(|res| res.map(TransactionMerkel::from).map_err(Error::from))
-            .collect())
+
+        let mut output = Vec::with_capacity(resp.len());
+
+        for res in resp {
+            output.push(TransactionMerkel::from(res?));
+        }
+
+        Ok(output)
     }
 
     /// Return the estimated transaction fee for a transaction to be confirmed within a certain number of blocks.
@@ -1758,7 +1795,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(merkle_batch.len(), 1);
-        let batch_entry = merkle_batch.into_iter().next().unwrap().unwrap();
+        let batch_entry = merkle_batch.into_iter().next().unwrap();
         assert_eq!(
             batch_entry.block_height.to_consensus_u32(),
             confirmation_height
