@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "socks")]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -23,7 +24,7 @@ use electrum_streaming_client::{
     AsyncPendingRequestTuple, AsyncRequestError, AsyncRequestSendError, BatchRequestError, Event,
     Request, ResponseError, SatisfiedRequest,
 };
-use futures_util::{StreamExt, future};
+use futures_util::{Stream, StreamExt, future, stream};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -643,8 +644,37 @@ impl ElectrumClient {
     /// When you call this method, you subscribe to the notifications channel from that precise moment.
     /// Anything received by client before that moment is not included in the channel!
     #[inline]
-    pub fn notifications(&self) -> broadcast::Receiver<ElectrumNotification> {
-        self.inner.notification_sender.subscribe()
+    pub fn notifications(&self) -> Pin<Box<dyn Stream<Item = ElectrumNotification> + Send>> {
+        if self.inner.status().is_shutdown() {
+            return Box::pin(stream::empty());
+        }
+
+        let rx = self.inner.notification_sender.subscribe();
+
+        Box::pin(stream::unfold(Some(rx), |state| async move {
+            let mut rx = state?;
+
+            loop {
+                match rx.recv().await {
+                    Ok(notification) => {
+                        let next_state = if matches!(notification, ElectrumNotification::Shutdown) {
+                            None
+                        } else {
+                            Some(rx)
+                        };
+
+                        return Some((notification, next_state));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(
+                            missed,
+                            "Notifications channel lagged; dropped notifications."
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }))
     }
 
     #[inline]
@@ -1288,6 +1318,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use bitcoin::Amount;
+    use futures_util::{FutureExt, StreamExt};
     use testenv::TestEnv;
     use tokio::time::{sleep, timeout};
 
@@ -1394,6 +1425,64 @@ mod tests {
 
         assert_eq!(inner.status(), InternalElectrumConnectionStatus::Shutdown);
         assert!(!inner.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_terminate_notification_stream_on_shutdown() {
+        let client: Arc<ElectrumClient> = Arc::new(test_client());
+
+        client.connect();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(client.is_running());
+
+        // Shutdown after some time
+        let c = client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            c.shutdown();
+        });
+
+        assert_ne!(
+            client.inner.status(),
+            InternalElectrumConnectionStatus::Shutdown
+        );
+
+        let fut = async {
+            let mut notifications = client.notifications();
+
+            let mut received = false;
+
+            // The stream must terminate after receiving the shutdown status
+            while let Some(n) = notifications.next().await {
+                if let ElectrumNotification::Shutdown = n {
+                    received = true;
+                }
+            }
+
+            // Make sure we received the shutdown status
+            assert!(received);
+        };
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client.inner.status(),
+            InternalElectrumConnectionStatus::Shutdown
+        );
+
+        // Try to get a new stream
+        let mut notifications = client.notifications();
+
+        let res = tokio::time::timeout(Duration::from_secs(1), notifications.next())
+            .await
+            .unwrap();
+
+        // Must return None, as it's empty
+        assert!(res.is_none());
     }
 
     #[tokio::test]
@@ -1585,14 +1674,14 @@ mod tests {
 
         let saw_header = timeout(Duration::from_secs(15), async {
             loop {
-                match notifications.recv().await {
-                    Ok(ElectrumNotification::BlockHeader { height, .. })
+                match notifications.next().await {
+                    Some(ElectrumNotification::BlockHeader { height, .. })
                         if height >= expected_height =>
                     {
                         return true;
                     }
-                    Ok(_) => {}
-                    Err(_) => return false,
+                    Some(_) => {}
+                    None => return false,
                 }
             }
         })
@@ -1615,10 +1704,10 @@ mod tests {
 
         let got_shutdown = timeout(Duration::from_secs(10), async {
             loop {
-                match notifications.recv().await {
-                    Ok(ElectrumNotification::Shutdown) => return true,
-                    Ok(_) => {}
-                    Err(_) => return false,
+                match notifications.next().await {
+                    Some(ElectrumNotification::Shutdown) => return true,
+                    Some(_) => {}
+                    None => return false,
                 }
             }
         })
@@ -1654,12 +1743,12 @@ mod tests {
 
         let saw_subscribed_update = timeout(Duration::from_secs(15), async {
             loop {
-                match notifications.recv().await {
-                    Ok(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
+                match notifications.next().await {
+                    Some(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
                         return true;
                     }
-                    Ok(_) => {}
-                    Err(_) => return false,
+                    Some(_) => {}
+                    None => return false,
                 }
             }
         })
@@ -1675,7 +1764,7 @@ mod tests {
         client.script_hash_subscribe(tracked_hash).await.unwrap();
 
         // Drain queue to avoid matching stale events from the previous tx.
-        while notifications.try_recv().is_ok() {}
+        while notifications.next().now_or_never().is_some() {}
 
         let txid = env
             .bitcoind
@@ -1688,12 +1777,12 @@ mod tests {
 
         let saw_resubscribed_update = timeout(Duration::from_secs(15), async {
             loop {
-                match notifications.recv().await {
-                    Ok(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
+                match notifications.next().await {
+                    Some(ElectrumNotification::ScriptHash { hash, .. }) if hash == tracked_hash => {
                         return true;
                     }
-                    Ok(_) => {}
-                    Err(_) => return false,
+                    Some(_) => {}
+                    None => return false,
                 }
             }
         })

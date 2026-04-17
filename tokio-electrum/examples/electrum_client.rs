@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{Address, Network};
+use futures_util::StreamExt;
 use tokio_electrum::prelude::*;
 
 #[tokio::main]
@@ -30,7 +31,7 @@ async fn main() {
     client.block_headers_subscribe().await.unwrap();
 
     // Handle notifications
-    while let Ok(notification) = notification.recv().await {
+    while let Some(notification) = notification.next().await {
         match notification {
             ElectrumNotification::ConnectionStatusChanged(status) => {
                 println!("Connection status changed: {:?}", status)

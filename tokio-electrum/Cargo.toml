@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "syn
 tokio-happy-eyeballs = "0.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-socks = { version =  "0.5", optional = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
 webpki-roots = "1.0"
 
