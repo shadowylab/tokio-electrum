@@ -37,6 +37,8 @@ pub struct ElectrumClientBuilder {
     pub request_timeout: Duration,
     /// Ping timeout
     pub ping_timeout: Duration,
+    /// Automatically reconnect on connection loss
+    pub reconnect: bool,
     /// Initial reconnect delay
     pub reconnect_delay_initial: Duration,
     /// Maximum reconnect delay
@@ -59,6 +61,7 @@ impl ElectrumClientBuilder {
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             ping_timeout: DEFAULT_PING_TIMEOUT,
+            reconnect: true,
             reconnect_delay_initial: DEFAULT_RECONNECT_DELAY_INITIAL,
             reconnect_delay_max: DEFAULT_RECONNECT_DELAY_MAX,
             max_consecutive_ping_timeouts: DEFAULT_MAX_CONSECUTIVE_PING_TIMEOUTS,
@@ -92,6 +95,13 @@ impl ElectrumClientBuilder {
     #[inline]
     pub fn ping_timeout(mut self, timeout: Duration) -> Self {
         self.ping_timeout = timeout;
+        self
+    }
+
+    /// Enable/disable automatic reconnection on connection loss (default: true)
+    #[inline]
+    pub fn reconnect(mut self, reconnect: bool) -> Self {
+        self.reconnect = reconnect;
         self
     }
 

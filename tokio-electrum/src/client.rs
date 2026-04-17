@@ -164,6 +164,7 @@ struct Config {
     connection_timeout: Duration,
     request_timeout: Duration,
     ping_timeout: Duration,
+    reconnect: bool,
     reconnect_delay_initial: Duration,
     reconnect_delay_max: Duration,
     max_consecutive_ping_timeouts: u8,
@@ -312,33 +313,43 @@ impl InnerClient {
                 break;
             }
 
-            // Check if the client is marked as disconnected. If not, update status.
-            // Check if disconnected to avoid a possible double log
-            if !status.is_disconnected_terminated_or_shutdown() {
-                self.set_status(InternalElectrumConnectionStatus::Disconnected, true);
-            }
+            // Check if reconnection is enabled
+            if self.config.reconnect {
+                // Check if the client is marked as disconnected. If not, update status.
+                // Check if disconnected to avoid a possible double log
+                if !status.is_disconnected_terminated_or_shutdown() {
+                    self.set_status(InternalElectrumConnectionStatus::Disconnected, true);
+                }
 
-            // Sleep before retry to connect
-            let interval = next_reconnect_interval(
-                reconnect_attempt,
-                self.config.reconnect_delay_initial,
-                self.config.reconnect_delay_max,
-            );
-            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                // Sleep before retry to connect
+                let interval = next_reconnect_interval(
+                    reconnect_attempt,
+                    self.config.reconnect_delay_initial,
+                    self.config.reconnect_delay_max,
+                );
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
 
-            tracing::debug!(
-                "Reconnecting to '{}' in {} secs",
-                self.addr,
-                interval.as_secs()
-            );
+                tracing::debug!(
+                    "Reconnecting to '{}' in {} secs",
+                    self.addr,
+                    interval.as_secs()
+                );
 
-            // Sleep before retry to connect
-            // Handle termination to allow exiting immediately if request is received during the sleep.
-            tokio::select! {
-                // Sleep
-                _ = time::sleep(interval) => {},
-                // Handle termination notification
-                _ = self.handle_terminate() => break,
+                // Sleep before retry to connect
+                // Handle termination to allow exiting immediately if request is received during the sleep.
+                tokio::select! {
+                    // Sleep
+                    _ = time::sleep(interval) => {},
+                    // Handle termination notification
+                    _ = self.handle_terminate() => break,
+                }
+            } else {
+                // Reconnection disabled, set status to "terminated"
+                self.set_status(InternalElectrumConnectionStatus::Terminated, true);
+
+                // Break loop and exit
+                tracing::debug!(addr = %self.addr, "Reconnection disabled, breaking loop.");
+                break;
             }
         }
 
@@ -625,6 +636,7 @@ impl ElectrumClient {
                     connection_timeout: builder.connection_timeout,
                     request_timeout: builder.request_timeout,
                     ping_timeout: builder.ping_timeout,
+                    reconnect: builder.reconnect,
                     reconnect_delay_initial: builder.reconnect_delay_initial,
                     reconnect_delay_max: builder.reconnect_delay_max,
                     max_consecutive_ping_timeouts: builder.max_consecutive_ping_timeouts.max(1),
