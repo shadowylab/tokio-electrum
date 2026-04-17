@@ -706,9 +706,6 @@ impl ElectrumClient {
         // Update status
         self.inner
             .set_status(InternalElectrumConnectionStatus::Terminated, true);
-
-        // Shutdown all notification loops
-        self.inner.send_notification(ElectrumNotification::Shutdown);
     }
 
     /// Terminate connection with the electrum server
@@ -1609,12 +1606,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_emits_shutdown_notification() {
+    async fn shutdown_emits_shutdown_notification() {
         let env = TestEnv::new();
         let client = connected_regtest_client(&env).await;
         let mut notifications = client.notifications();
 
-        client.disconnect();
+        client.shutdown();
 
         let got_shutdown = timeout(Duration::from_secs(10), async {
             loop {
