@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -93,14 +94,11 @@ impl BdkElectrumClient {
     pub async fn full_scan<K: Ord + Clone>(
         &self,
         request: impl Into<FullScanRequest<K>>,
-        stop_gap: usize,
-        batch_size: usize,
+        stop_gap: NonZeroUsize,
+        batch_size: NonZeroUsize,
         fetch_prev_txouts: bool,
     ) -> Result<FullScanResponse<K>, Error> {
         let mut request: FullScanRequest<K> = request.into();
-        let stop_gap = stop_gap.max(1);
-        let batch_size = batch_size.max(1);
-
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
@@ -164,11 +162,10 @@ impl BdkElectrumClient {
     pub async fn sync<I>(
         &self,
         request: impl Into<SyncRequest<I>>,
-        batch_size: usize,
+        batch_size: NonZeroUsize,
         fetch_prev_txouts: bool,
     ) -> Result<SyncResponse<ConfirmationBlockTime>, Error> {
         let mut request: SyncRequest<I> = request.into();
-        let batch_size = batch_size.max(1);
         let start_time = request.start_time();
 
         let tip_and_latest_blocks = match request.chain_tip() {
@@ -185,7 +182,7 @@ impl BdkElectrumClient {
                 .iter_spks_with_expected_txids()
                 .enumerate()
                 .map(|(i, spk)| (i as u32, spk)),
-            usize::MAX,
+            unsafe { NonZeroUsize::new_unchecked(usize::MAX) },
             batch_size,
             &mut pending_anchors,
         )
@@ -236,12 +233,15 @@ impl BdkElectrumClient {
         start_time: u64,
         tx_update: &mut TxUpdate<ConfirmationBlockTime>,
         mut spks_with_expected_txids: impl Iterator<Item = (u32, SpkWithExpectedTxids)>,
-        stop_gap: usize,
-        batch_size: usize,
+        stop_gap: NonZeroUsize,
+        batch_size: NonZeroUsize,
         pending_anchors: &mut Vec<(Txid, u32)>,
     ) -> Result<Option<u32>, Error> {
+        let stop_gap: usize = stop_gap.get();
+        let batch_size: usize = batch_size.get();
+
         let mut last_active_index: Option<u32> = None;
-        let mut unused_spk_count = 0_usize;
+        let mut unused_spk_count: usize = 0;
 
         loop {
             let spks = (0..batch_size)
@@ -439,9 +439,10 @@ impl BdkElectrumClient {
     async fn batch_fetch_anchors(
         &self,
         txs_with_heights: &[(Txid, u32)],
-        batch_size: usize,
+        batch_size: NonZeroUsize,
     ) -> Result<Vec<(Txid, ConfirmationBlockTime)>, Error> {
-        let batch_size = batch_size.max(1);
+        let batch_size: usize = batch_size.get();
+
         let mut results = Vec::with_capacity(txs_with_heights.len());
         let mut to_fetch = Vec::new();
 

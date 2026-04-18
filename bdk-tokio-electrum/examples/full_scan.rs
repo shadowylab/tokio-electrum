@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,15 @@ async fn main() {
     let mut wallet = Wallet::create_from_two_path_descriptor("wpkh(tpubDDks68wKK1xKaVVVbNmXUAx68K1K817M6KwjvjEyCrjdU7xMvjKnfYAtZjfZcrfPfGFzqmibuVqMzKJGbBnK7mo7WSJri8Y9QgM7aNQ3fCp/<0;1>/*)").network(Network::Testnet4).create_wallet_no_persist().unwrap();
 
     let request = wallet.start_full_scan().build();
-    let update = client.full_scan(request, 20, 20, false).await.unwrap();
+    let update = client
+        .full_scan(
+            request,
+            NonZeroUsize::new(20).unwrap(),
+            NonZeroUsize::new(20).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
     wallet.apply_update(update).unwrap();
     println!("Initial full scan completed.");
 }
