@@ -10,7 +10,7 @@ use bdk_core::spk_client::{
 use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use tokio::sync::{Mutex, RwLock};
 pub use tokio_electrum::client::{ElectrumClient, Error};
-use tokio_electrum::types::{BlockHeader, ElectrumScriptHash};
+use tokio_electrum::types::{BlockHeader, ElectrumScriptHash, TransactionMerkel};
 
 use crate::util;
 
@@ -139,7 +139,10 @@ impl BdkElectrumClient {
         }
 
         if !pending_anchors.is_empty() {
-            let anchors = self.batch_fetch_anchors(&pending_anchors).await?;
+            let anchors = self
+                .batch_fetch_anchors(&pending_anchors, batch_size)
+                .await?;
+
             for (txid, anchor) in anchors {
                 tx_update.anchors.insert((anchor, txid));
             }
@@ -208,7 +211,10 @@ impl BdkElectrumClient {
         }
 
         if !pending_anchors.is_empty() {
-            let anchors = self.batch_fetch_anchors(&pending_anchors).await?;
+            let anchors = self
+                .batch_fetch_anchors(&pending_anchors, batch_size)
+                .await?;
+
             for (txid, anchor) in anchors {
                 tx_update.anchors.insert((anchor, txid));
             }
@@ -433,7 +439,9 @@ impl BdkElectrumClient {
     async fn batch_fetch_anchors(
         &self,
         txs_with_heights: &[(Txid, u32)],
+        batch_size: usize,
     ) -> Result<Vec<(Txid, ConfirmationBlockTime)>, Error> {
+        let batch_size = batch_size.max(1);
         let mut results = Vec::with_capacity(txs_with_heights.len());
         let mut to_fetch = Vec::new();
 
@@ -458,13 +466,43 @@ impl BdkElectrumClient {
             }
 
             if !missing_heights.is_empty() {
-                let headers = self
-                    .inner
-                    .batch_block_header(missing_heights.clone())
-                    .await?;
-                for (height, header) in missing_heights.into_iter().zip(headers) {
-                    height_to_hash.insert(height, header.block_hash());
-                    cache.insert(height, header);
+                for heights_chunk in missing_heights.chunks(batch_size) {
+                    let headers: Vec<Header> = match self
+                        .inner
+                        .batch_block_header(heights_chunk.iter().copied())
+                        .await
+                    {
+                        Ok(headers) => headers,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                batch_size = heights_chunk.len(),
+                                "Batch header fetch failed; retrying with single requests."
+                            );
+
+                            let mut headers: Vec<Header> = Vec::with_capacity(heights_chunk.len());
+
+                            for height in heights_chunk.iter().copied() {
+                                match self.inner.block_header(height).await {
+                                    Ok(header) => headers.push(header),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            height,
+                                            error = %error,
+                                            "Skipping header fetch for anchor validation."
+                                        );
+                                    }
+                                }
+                            }
+
+                            headers
+                        }
+                    };
+
+                    for (height, header) in heights_chunk.iter().copied().zip(headers) {
+                        height_to_hash.insert(height, header.block_hash());
+                        cache.insert(height, header);
+                    }
                 }
             }
         }
@@ -473,7 +511,15 @@ impl BdkElectrumClient {
         {
             let anchor_cache = self.anchor_cache.lock().await;
             for &(txid, height) in txs_with_heights {
-                let hash = height_to_hash[&height];
+                let Some(hash) = height_to_hash.get(&height).copied() else {
+                    tracing::warn!(
+                        txid = %txid,
+                        height,
+                        "Skipping anchor validation because block header is missing."
+                    );
+                    continue;
+                };
+
                 if let Some(anchor) = anchor_cache.get(&(txid, hash)) {
                     results.push((txid, *anchor));
                 } else {
@@ -482,43 +528,99 @@ impl BdkElectrumClient {
             }
         }
 
-        // Fetch merkle proofs.
-        let proofs = self
-            .inner
-            .batch_transaction_get_merkle(to_fetch.iter().map(|&(txid, height)| (txid, height)))
-            .await?;
-
-        // Validate each proof, retrying once for each stale header.
-        for ((txid, height), proof) in to_fetch.into_iter().zip(proofs.into_iter()) {
-            let mut header = {
-                let cache = self.block_header_cache.lock().await;
-                cache
-                    .get(&(height))
+        // Fetch merkle proofs in conservative chunks and fallback to single-request mode if a
+        // chunk fails. Some public servers disconnect on large/expensive proof batches.
+        for tx_chunk in to_fetch.chunks(batch_size) {
+            let chunk_proofs: Vec<(Txid, u32, Option<TransactionMerkel>)> = match self
+                .inner
+                .batch_transaction_get_merkle(tx_chunk.iter().copied())
+                .await
+            {
+                Ok(proofs) => tx_chunk
+                    .iter()
                     .copied()
-                    .expect("header already fetched above")
+                    .zip(proofs.into_iter().map(Some))
+                    .map(|((txid, height), proof)| (txid, height, proof))
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        batch_size = tx_chunk.len(),
+                        "Batch merkle fetch failed; retrying with single requests."
+                    );
+
+                    let mut proofs = Vec::with_capacity(tx_chunk.len());
+                    for (txid, height) in tx_chunk.iter().copied() {
+                        match self.inner.transaction_get_merkle(txid, height).await {
+                            Ok(proof) => proofs.push((txid, height, Some(proof))),
+                            Err(error) => {
+                                tracing::warn!(
+                                    txid = %txid,
+                                    height,
+                                    error = %error,
+                                    "Skipping merkle proof fetch for anchor validation."
+                                );
+                                proofs.push((txid, height, None));
+                            }
+                        }
+                    }
+
+                    proofs
+                }
             };
-            let mut valid = util::validate_merkle_proof(&txid, &header.merkle_root, &proof);
-            if !valid {
-                header = self.inner.block_header(height).await?;
 
-                let mut cache = self.block_header_cache.lock().await;
-                cache.insert(height, header);
-
-                valid = util::validate_merkle_proof(&txid, &header.merkle_root, &proof);
-            }
-
-            // Build and cache the anchor if merkle proof is valid.
-            if valid {
-                let hash = header.block_hash();
-                let anchor = ConfirmationBlockTime {
-                    confirmation_time: header.time as u64,
-                    block_id: BlockId { height, hash },
+            // Validate each proof, retrying once for each stale header.
+            for (txid, height, maybe_proof) in chunk_proofs {
+                let Some(proof) = maybe_proof else {
+                    continue;
                 };
 
-                let mut anchor_cache = self.anchor_cache.lock().await;
-                anchor_cache.insert((txid, hash), anchor);
+                let mut header: Header = {
+                    let cache = self.block_header_cache.lock().await;
+                    cache
+                        .get(&(height))
+                        .copied()
+                        .expect("header already fetched above")
+                };
 
-                results.push((txid, anchor));
+                let mut valid: bool =
+                    util::validate_merkle_proof(&txid, &header.merkle_root, &proof);
+
+                if !valid {
+                    match self.inner.block_header(height).await {
+                        Ok(fresh_header) => {
+                            header = fresh_header;
+
+                            let mut cache = self.block_header_cache.lock().await;
+                            cache.insert(height, header);
+
+                            valid = util::validate_merkle_proof(&txid, &header.merkle_root, &proof);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                txid = %txid,
+                                height,
+                                error = %error,
+                                "Skipping stale-header retry during anchor validation."
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // Build and cache the anchor if merkle proof is valid.
+                if valid {
+                    let hash = header.block_hash();
+                    let anchor = ConfirmationBlockTime {
+                        confirmation_time: header.time as u64,
+                        block_id: BlockId { height, hash },
+                    };
+
+                    let mut anchor_cache = self.anchor_cache.lock().await;
+                    anchor_cache.insert((txid, hash), anchor);
+
+                    results.push((txid, anchor));
+                }
             }
         }
 
